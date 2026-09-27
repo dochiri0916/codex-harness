@@ -1,7 +1,7 @@
 {
   "docs_only": [
     "README.md",
-    "README.*",
+    "README.*.md",
     "CHANGELOG.md",
     "docs/**",
     "**/*.md"

@@ -66,6 +66,26 @@ def state_dir() -> Path:
     return Path.home() / ".local" / "state" / "codex-harness"
 
 
+def state_key(session_id: str, turn_id: str) -> str:
+    session_key = hashlib.sha256(session_id.encode("utf-8", "surrogatepass")).hexdigest()
+    turn_key = hashlib.sha256(turn_id.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"{session_key}-{turn_key}"
+
+
+def clear_state(path: Path, session_id: str) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    session_key = hashlib.sha256(session_id.encode("utf-8", "surrogatepass")).hexdigest()
+    active_path = state_dir() / f"{session_key}.active"
+    try:
+        if active_path.read_text(encoding="utf-8").strip() == path.name:
+            active_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
 def git(root: Path, *args: str) -> bytes:
     return subprocess.run(
         ["git", "-C", str(root), *args],
@@ -224,14 +244,14 @@ def main() -> int:
     try:
         event = json.load(sys.stdin)
         session_id = event.get("session_id")
+        turn_id = event.get("turn_id")
         cwd = event.get("cwd")
-        if not isinstance(session_id, str) or not session_id or not isinstance(cwd, str):
+        if not isinstance(session_id, str) or not session_id or not isinstance(turn_id, str) or not turn_id or not isinstance(cwd, str):
             emit({})
             return 0
-        key = hashlib.sha256(session_id.encode("utf-8", "surrogatepass")).hexdigest()
-        state_path = state_dir() / f"{key}.json"
+        state_path = state_dir() / f"{state_key(session_id, turn_id)}.json"
         if not state_path.is_file():
-            emit({})
+            emit({"systemMessage": "NEEDS_REVIEW: Codex Harness has no snapshot for this turn; verification could not determine changed files."})
             return 0
         state = json.loads(state_path.read_text(encoding="utf-8"))
         root = Path(state["root"])
@@ -241,28 +261,34 @@ def main() -> int:
         current = repository_snapshot(root)
         files = changed_files(state.get("files", {}), current)
         if not files:
+            clear_state(state_path, session_id)
             emit({})
             return 0
         if docs_only(files):
+            clear_state(state_path, session_id)
             emit({})
             return 0
 
         capability = project_capability(root)
         if capability == "GENERIC_PROJECT":
+            clear_state(state_path, session_id)
             emit({"systemMessage": "Hook · No supported verifier for this project; verification skipped."})
             return 0
 
         success, reason = run_check(root)
         if success:
             if capability == "HARNESS_PROJECT":
+                clear_state(state_path, session_id)
                 emit({"systemMessage": "Hook · Harness check passed."})
                 return 0
             report = root / "build" / "reports" / "build-convention" / "report.json"
             if not report.is_file():
+                clear_state(state_path, session_id)
                 emit({"systemMessage": "Gradle check passed. Local Risk Gate: NEEDS_REVIEW (ERROR). Build Convention report is missing."})
                 return 0
             decision, reason_codes, detail = run_risk_gate(root)
             if decision == "PASS":
+                clear_state(state_path, session_id)
                 emit({"systemMessage": "Gradle check passed. Local Risk Gate: PASS."})
             elif decision == "BLOCK":
                 failures = int(state.get("failures", 0)) + 1
@@ -270,15 +296,19 @@ def main() -> int:
                 write_state(state_path, state)
                 codes = ", ".join(reason_codes) if reason_codes else "unspecified"
                 if failures >= MAX_FAILURES:
+                    clear_state(state_path, session_id)
                     emit({"systemMessage": f"NEEDS_REVIEW: Local Risk Gate blocked {failures} times; automatic continuation limit reached. reasonCodes: {codes}."})
                 else:
-                    marker = f"[[CODEX_HARNESS_RETRY:{key[:12]}]]"
+                    marker = f"[[CODEX_HARNESS_RETRY:{hashlib.sha256(session_id.encode('utf-8', 'surrogatepass')).hexdigest()[:12]}]]"
                     emit({"decision": "block", "reason": f"{marker} Local Risk Gate: BLOCK. reasonCodes: {codes}. Fix the reported risks and rerun Gradle check and Risk Gate. Automatic verification attempt {failures} of {MAX_FAILURES}."})
             elif decision == "NOT_CONFIGURED":
+                clear_state(state_path, session_id)
                 emit({"systemMessage": "Gradle check passed. Local Risk Gate: NOT_CONFIGURED. Configure riskGateHome in ~/.config/codex-harness/config.json or set RISK_GATE_HOME."})
             elif decision == "REVIEW":
-                emit({"systemMessage": "Gradle check passed. Local Risk Gate: NEEDS_REVIEW (REVIEW). Human review required."})
+                clear_state(state_path, session_id)
+                emit({"systemMessage": "Hook · Gradle check passed.\nLocal Risk Gate: NEEDS_REVIEW (REVIEW)."})
             else:
+                clear_state(state_path, session_id)
                 suffix = f" {detail}" if detail else ""
                 emit({"systemMessage": f"Gradle check passed. Local Risk Gate: NEEDS_REVIEW (ERROR).{suffix}"})
             return 0
@@ -287,9 +317,10 @@ def main() -> int:
         state["failures"] = failures
         write_state(state_path, state)
         if failures >= MAX_FAILURES:
+            clear_state(state_path, session_id)
             emit({"systemMessage": f"NEEDS_REVIEW: Gradle check failed {failures} times; automatic continuation limit reached. {reason}"})
             return 0
-        marker = f"[[CODEX_HARNESS_RETRY:{key[:12]}]]"
+        marker = f"[[CODEX_HARNESS_RETRY:{hashlib.sha256(session_id.encode('utf-8', 'surrogatepass')).hexdigest()[:12]}]]"
         emit({"decision": "block", "reason": f"{marker} {reason}\nAutomatic verification attempt {failures} of {MAX_FAILURES}. Fix the failure and stop again to rerun the check."})
         return 0
     except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError):

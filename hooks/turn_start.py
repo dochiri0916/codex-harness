@@ -19,6 +19,12 @@ def state_dir() -> Path:
     return Path.home() / ".local" / "state" / "codex-harness"
 
 
+def state_key(session_id: str, turn_id: str) -> str:
+    session_key = hashlib.sha256(session_id.encode("utf-8", "surrogatepass")).hexdigest()
+    turn_key = hashlib.sha256(turn_id.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"{session_key}-{turn_key}"
+
+
 def git(root: Path, *args: str) -> bytes:
     return subprocess.run(
         ["git", "-C", str(root), *args],
@@ -99,18 +105,35 @@ def main() -> int:
         cwd = event.get("cwd")
         if not all(isinstance(value, str) and value for value in (session_id, turn_id, cwd)):
             return 0
-        key = hashlib.sha256(session_id.encode("utf-8", "surrogatepass")).hexdigest()
+        session_key = hashlib.sha256(session_id.encode("utf-8", "surrogatepass")).hexdigest()
+        key = state_key(session_id, turn_id)
         path = state_dir() / f"{key}.json"
-        retry_marker = f"[[CODEX_HARNESS_RETRY:{key[:12]}]]"
+        active_path = state_dir() / f"{session_key}.active"
+        retry_marker = f"[[CODEX_HARNESS_RETRY:{session_key[:12]}]]"
         prompt = event.get("prompt")
-        if isinstance(prompt, str) and prompt.startswith(retry_marker) and path.is_file():
-            # Stop-hook continuation prompts are internally submitted as user prompts.
-            # Keep the original baseline and failure count across those retries.
+        if isinstance(prompt, str) and prompt.startswith(retry_marker) and active_path.is_file():
+            # Keep the baseline across a Stop-hook continuation, even if Codex gives
+            # the continued prompt a new turn id.
+            previous = state_dir() / active_path.read_text(encoding="utf-8").strip()
+            if previous.is_file():
+                payload = json.loads(previous.read_text(encoding="utf-8"))
+                payload["turn_id"] = turn_id
+                write_state(path, payload)
+                active_path.write_text(path.name, encoding="utf-8")
+                if previous != path:
+                    previous.unlink()
             return 0
         result = repository_snapshot(Path(cwd))
         if result is None:
             return 0
         root, files = result
+        if active_path.is_file():
+            previous = state_dir() / active_path.read_text(encoding="utf-8").strip()
+            if previous != path:
+                try:
+                    previous.unlink()
+                except FileNotFoundError:
+                    pass
         write_state(path, {
             "session_id": session_id,
             "turn_id": turn_id,
@@ -118,6 +141,7 @@ def main() -> int:
             "files": files,
             "failures": 0,
         })
+        active_path.write_text(path.name, encoding="utf-8")
     except (ValueError, OSError, json.JSONDecodeError):
         # Snapshotting is advisory; never prevent the prompt from being submitted.
         return 0

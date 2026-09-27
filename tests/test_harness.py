@@ -43,7 +43,14 @@ def invoke_stop(root: Path) -> dict[str, object]:
     from io import StringIO
     import contextlib
 
-    event = {"session_id": "session-1", "turn_id": "turn-1", "cwd": str(root)}
+    key = hashlib.sha256(b"session-1").hexdigest()
+    active = Path(os.environ["CODEX_HARNESS_STATE_DIR"]) / f"{key}.active"
+    turn_id = "turn-1"
+    if active.is_file():
+        state_path = active.parent / active.read_text(encoding="utf-8").strip()
+        if state_path.is_file():
+            turn_id = json.loads(state_path.read_text(encoding="utf-8"))["turn_id"]
+    event = {"session_id": "session-1", "turn_id": turn_id, "cwd": str(root)}
     output = StringIO()
     with patch.object(sys, "stdin", StringIO(json.dumps(event))), contextlib.redirect_stdout(output):
         stop_verify.main()
@@ -75,10 +82,18 @@ class HarnessTests(unittest.TestCase):
         self.assertIsNotNone(result)
         repo, files = result
         self.state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        key = hashlib.sha256(b"session-1").hexdigest()
         state = {"session_id": "session-1", "turn_id": "turn-1", "root": repo, "files": files, "failures": 0}
-        (self.state_root / f"{key}.json").write_text(json.dumps(state))
-        return self.state_root / f"{key}.json"
+        key = turn_start.state_key("session-1", "turn-1")
+        state_path = self.state_root / f"{key}.json"
+        state_path.write_text(json.dumps(state))
+        session_key = hashlib.sha256(b"session-1").hexdigest()
+        (self.state_root / f"{session_key}.active").write_text(state_path.name)
+        return state_path
+
+    def active_state_path(self) -> Path:
+        session_key = hashlib.sha256(b"session-1").hexdigest()
+        active = self.state_root / f"{session_key}.active"
+        return self.state_root / active.read_text(encoding="utf-8").strip()
 
     def test_no_change_and_docs_only_skip_check(self) -> None:
         self.start_turn()
@@ -86,8 +101,10 @@ class HarnessTests(unittest.TestCase):
         with patch.object(stop_verify, "run_check", side_effect=lambda path: calls.append(path) or (True, "")), \
                 patch.object(stop_verify, "run_risk_gate") as risk_gate:
             self.assertEqual(invoke_stop(self.root), {})
+            self.start_turn()
             (self.root / "README.md").write_text("docs changed\n")
             self.assertEqual(invoke_stop(self.root), {})
+            self.start_turn()
             (self.root / "NOTES.md").write_text("markdown changed\n")
             self.assertEqual(invoke_stop(self.root), {})
         self.assertEqual(calls, [])
@@ -144,7 +161,7 @@ class HarnessTests(unittest.TestCase):
         risk_gate.assert_not_called()
         self.assertEqual(result, {"systemMessage": "Hook · Harness check passed."})
         self.assertFalse(report.exists())
-        self.assertEqual(json.loads(state_path.read_text())["failures"], 0)
+        self.assertFalse(state_path.exists())
 
     def test_generic_project_skips_unsupported_verification(self) -> None:
         (self.root / "build.gradle").write_text("plugins { id 'some.other.plugin' }\n")
@@ -155,7 +172,7 @@ class HarnessTests(unittest.TestCase):
         check.assert_not_called()
         risk_gate.assert_not_called()
         self.assertIn("verification skipped", result["systemMessage"])
-        self.assertEqual(json.loads(state_path.read_text())["failures"], 0)
+        self.assertFalse(state_path.exists())
 
     def test_build_convention_success_runs_risk_gate(self) -> None:
         self.start_turn()
@@ -182,12 +199,41 @@ class HarnessTests(unittest.TestCase):
         (self.root / "Main.java").write_text("class Main { int preexisting = 1; }\n")
         self.start_turn()
         calls: list[Path] = []
-        with patch.object(stop_verify, "run_check", side_effect=lambda path: calls.append(path) or (True, "")):
-            self.assertEqual(invoke_stop(self.root), {})
-            (self.root / "Main.java").write_text("class Main { int preexisting = 1; int turn = 2; }\n")
-            with patch.object(stop_verify, "run_risk_gate", return_value=("PASS", [], "")):
-                self.assertIn("systemMessage", invoke_stop(self.root))
+        (self.root / "Main.java").write_text("class Main { int preexisting = 1; int turn = 2; }\n")
+        with patch.object(stop_verify, "run_check", side_effect=lambda path: calls.append(path) or (True, "")), \
+                patch.object(stop_verify, "run_risk_gate", return_value=("PASS", [], "")):
+            self.assertIn("systemMessage", invoke_stop(self.root))
         self.assertEqual(calls, [self.root.resolve()])
+
+    def test_build_gradle_comment_change_is_verify_even_if_already_dirty(self) -> None:
+        for preexisting_dirty in (False, True):
+            with self.subTest(preexisting_dirty=preexisting_dirty):
+                if preexisting_dirty:
+                    (self.root / "build.gradle").write_text(
+                        "plugins { id 'io.github.dochiri0916.build-convention' }\n// preexisting\n"
+                    )
+                self.start_turn()
+                with (self.root / "build.gradle").open("a", encoding="utf-8") as stream:
+                    stream.write("// turn change\n")
+                files = stop_verify.changed_files(
+                    json.loads(self.active_state_path().read_text())["files"],
+                    stop_verify.repository_snapshot(self.root),
+                )
+                self.assertIn("build.gradle", files)
+                self.assertFalse(stop_verify.docs_only(files))
+
+    def test_docs_and_build_gradle_mixed_change_is_verify(self) -> None:
+        self.start_turn()
+        (self.root / "README.md").write_text("docs changed\n")
+        with (self.root / "build.gradle").open("a", encoding="utf-8") as stream:
+            stream.write("// verify change\n")
+        files = stop_verify.changed_files(
+            json.loads(self.active_state_path().read_text())["files"],
+            stop_verify.repository_snapshot(self.root),
+        )
+        self.assertIn("README.md", files)
+        self.assertIn("build.gradle", files)
+        self.assertFalse(stop_verify.docs_only(files))
 
     def test_gradle_failure_does_not_run_risk_gate(self) -> None:
         self.start_turn()
@@ -222,7 +268,7 @@ class HarnessTests(unittest.TestCase):
             fifth = invoke_stop(self.root)
         self.assertIn("NEEDS_REVIEW", fifth["systemMessage"])
         self.assertNotIn("decision", fifth)
-        self.assertEqual(json.loads(state_path.read_text())["failures"], 5)
+        self.assertFalse(state_path.exists())
 
     def test_risk_review_and_error_need_review_without_continuation(self) -> None:
         for decision, expected in (("REVIEW", "REVIEW"), ("ERROR", "ERROR")):
@@ -235,7 +281,37 @@ class HarnessTests(unittest.TestCase):
                 self.assertIn("NEEDS_REVIEW", result["systemMessage"])
                 self.assertIn(expected, result["systemMessage"])
                 self.assertNotIn("decision", result)
-                self.assertEqual(json.loads(state_path.read_text())["failures"], 0)
+                self.assertFalse(state_path.exists())
+
+    def test_build_gradle_review_has_required_message_and_no_continuation(self) -> None:
+        self.start_turn()
+        with (self.root / "build.gradle").open("a", encoding="utf-8") as stream:
+            stream.write("// harmless comment\n")
+        with patch.object(stop_verify, "run_check", return_value=(True, "")) as check, \
+                patch.object(stop_verify, "run_risk_gate", return_value=("REVIEW", ["RISK_SCORE_REVIEW_THRESHOLD"], "")) as risk_gate:
+            result = invoke_stop(self.root)
+        check.assert_called_once_with(self.root.resolve())
+        risk_gate.assert_called_once_with(self.root.resolve())
+        self.assertEqual(result, {"systemMessage": "Hook · Gradle check passed.\nLocal Risk Gate: NEEDS_REVIEW (REVIEW)."})
+        self.assertNotIn("decision", result)
+
+    def test_turn_snapshot_is_scoped_by_session_and_turn_and_cleaned_on_terminal_stop(self) -> None:
+        start_turn = {"session_id": "session-1", "turn_id": "turn-a", "cwd": str(self.root)}
+        from io import StringIO
+        import contextlib
+        with patch.object(sys, "stdin", StringIO(json.dumps(start_turn))), contextlib.redirect_stdout(StringIO()):
+            turn_start.main()
+        path_a = self.state_root / f"{turn_start.state_key('session-1', 'turn-a')}.json"
+        self.assertTrue(path_a.is_file())
+        (self.root / "README.md").write_text("docs this turn\n")
+        stop_event = {"session_id": "session-1", "turn_id": "turn-b", "cwd": str(self.root)}
+        output = StringIO()
+        with patch.object(sys, "stdin", StringIO(json.dumps(stop_event))), contextlib.redirect_stdout(output):
+            stop_verify.main()
+        result = json.loads(output.getvalue())
+        self.assertIn("NEEDS_REVIEW", result["systemMessage"])
+        self.assertIn("no snapshot for this turn", result["systemMessage"])
+        self.assertTrue(path_a.is_file())
 
     def test_stop_hook_uses_machine_config_without_risk_gate_environment(self) -> None:
         self.start_turn()
@@ -384,7 +460,7 @@ class HarnessTests(unittest.TestCase):
             first = invoke_stop(self.root)
             self.assertEqual(first["decision"], "block")
             invoke_start(self.root, first["reason"])
-            self.assertEqual(json.loads(state_path.read_text())["failures"], 1)
+            self.assertEqual(json.loads(self.active_state_path().read_text())["failures"], 1)
             for _ in range(3):
                 again = invoke_stop(self.root)
                 self.assertEqual(again["decision"], "block")
@@ -392,7 +468,7 @@ class HarnessTests(unittest.TestCase):
             fifth = invoke_stop(self.root)
         self.assertIn("NEEDS_REVIEW", fifth["systemMessage"])
         self.assertNotIn("decision", fifth)
-        self.assertEqual(json.loads(state_path.read_text())["failures"], 5)
+        self.assertFalse(state_path.exists())
 
     def test_untracked_source_is_detected_and_state_is_outside_repository(self) -> None:
         self.start_turn()

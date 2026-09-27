@@ -20,9 +20,10 @@ import risk_gate_config
 
 
 class ShipError(Exception):
-    def __init__(self, message: str, code: int = 4):
+    def __init__(self, message: str, code: int = 4, *, category: str | None = None):
         super().__init__(message)
         self.code = code
+        self.category = category
 
 
 def git(root: Path, *args: str, check: bool = True) -> str:
@@ -33,6 +34,14 @@ def git(root: Path, *args: str, check: bool = True) -> str:
     if check and result.returncode:
         raise ShipError("Git command failed.")
     return result.stdout.strip()
+
+
+def github(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run every GitHub CLI command in the target repository context."""
+    return subprocess.run(
+        ["gh", *args], cwd=root, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, check=False,
+    )
 
 
 def repository_identity(root: Path) -> str:
@@ -100,10 +109,7 @@ def load_config() -> dict[str, object]:
 
 
 def default_branch(root: Path, repo: str) -> str:
-    result = subprocess.run(
-        ["gh", "repo", "view", repo, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"],
-        cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
-    )
+    result = github(root, "repo", "view", repo, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name")
     if result.returncode or not result.stdout.strip():
         raise ShipError("Could not determine the remote default branch.")
     return result.stdout.strip()
@@ -134,23 +140,28 @@ PR_FIELDS = "number,url,state,headRefName,headRefOid"
 
 
 def pull_request(root: Path, repo: str, branch: str, head: str) -> dict[str, object]:
-    result = subprocess.run(
-        ["gh", "pr", "view", "--repo", repo, "--json", PR_FIELDS],
-        cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
-    )
+    result = github(root, "pr", "view", "--repo", repo, "--json", PR_FIELDS)
     if result.returncode:
-        raise ShipError("Could not read pull request metadata.")
+        diagnostic = result.stderr.lower()
+        if "no pull requests found" in diagnostic or "could not find any pull requests" in diagnostic:
+            raise ShipError("No pull request was found for the target branch.", category="PR_NOT_FOUND")
+        raise ShipError("Could not read pull request metadata.", category="GH_COMMAND_FAILED")
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
-        raise ShipError("GitHub CLI returned invalid pull request data.") from exc
+        raise ShipError("GitHub CLI returned invalid pull request data.", category="MALFORMED_PR_METADATA") from exc
     if not isinstance(data, dict):
-        raise ShipError("GitHub CLI returned invalid pull request data.")
+        raise ShipError("GitHub CLI returned invalid pull request data.", category="MALFORMED_PR_METADATA")
     number, url = data.get("number"), data.get("url")
-    if not isinstance(number, int) or isinstance(number, bool) or not isinstance(url, str) or not url.strip():
-        raise ShipError("GitHub CLI returned incomplete pull request metadata.")
-    if data.get("state") != "OPEN" or data.get("headRefName") != branch or data.get("headRefOid") != head:
-        raise ShipError("Pull request state or head does not match the pushed branch.")
+    state, head_name, head_oid = data.get("state"), data.get("headRefName"), data.get("headRefOid")
+    if (not isinstance(number, int) or isinstance(number, bool) or number <= 0
+            or not isinstance(url, str) or not url.strip()
+            or not isinstance(state, str) or not state.strip()
+            or not isinstance(head_name, str) or not head_name.strip()
+            or not isinstance(head_oid, str) or not head_oid.strip()):
+        raise ShipError("GitHub CLI returned incomplete pull request metadata.", category="MALFORMED_PR_METADATA")
+    if state != "OPEN" or head_name != branch or head_oid != head:
+        raise ShipError("Pull request state or head does not match the pushed branch.", category="PR_HEAD_MISMATCH")
     return {"prNumber": number, "prUrl": url}
 
 
@@ -283,10 +294,7 @@ def ship(root: Path, message: str | None = None, summary: str | None = None) -> 
     if result.returncode:
         raise ShipError("Git push failed.")
     write_ship_state(root, branch, commit, attestation)
-    existing = subprocess.run(
-        ["gh", "pr", "list", "--repo", repo, "--head", branch, "--state", "open", "--json", "number", "--limit", "1"],
-        cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
-    )
+    existing = github(root, "pr", "list", "--repo", repo, "--head", branch, "--state", "open", "--json", "number", "--limit", "1")
     if existing.returncode:
         raise ShipError("Could not inspect open pull requests.")
     try:
@@ -303,11 +311,8 @@ def ship(root: Path, message: str | None = None, summary: str | None = None) -> 
         "## Summary", "", f"- {title}", "", "## Validation", "",
         "- Verifier: PASS", "- Build Convention: PASS", "- Local Risk Gate: PASS", "- Jev: PASS",
     ])
-    created = subprocess.run(
-        ["gh", "pr", "create", "--repo", repo, "--base", base, "--head", branch,
-         "--title", title, "--body", body], cwd=root,
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
-    )
+    created = github(root, "pr", "create", "--repo", repo, "--base", base, "--head", branch,
+                     "--title", title, "--body", body)
     if created.returncode:
         raise ShipError("Pull request creation failed.")
     pr = pull_request(root, repo, branch, commit)

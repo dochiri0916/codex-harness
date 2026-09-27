@@ -16,7 +16,8 @@ def main() -> int:
     parser.add_argument("--summary", help="short pull request summary")
     args = parser.parse_args()
     try:
-        result = ship(Path.cwd(), args.message, args.summary)
+        target_root = Path.cwd().resolve()
+        result = ship(target_root, args.message, args.summary)
     except ShipError as exc:
         emit({"status": "ERROR", "message": str(exc)})
         return exc.code

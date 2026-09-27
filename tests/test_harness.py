@@ -765,6 +765,108 @@ class ShipWorkflowTests(unittest.TestCase):
             self.assertEqual(git_output(external_root, "rev-parse", "HEAD"), head_before)
             self.assertEqual(git_output(external_root, "status", "--porcelain"), "")
 
+    def test_external_cwd_partial_recovery_uses_target_for_gh_and_parses_pretty_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir)
+            target = make_repo(parent)
+            git(target, "checkout", "-qB", "feat/auto-ship-e2e")
+            git(target, "remote", "add", "origin", "git@github.com:dochiri0916/validation-lab.git")
+            head = git_output(target, "rev-parse", "HEAD")
+            original_head = head
+            state_root = parent / "state"
+            attestation = {
+                "repositoryIdentity": ship_workflow.repository_identity(target),
+                "branch": "feat/auto-ship-e2e", "validation": "PASS",
+                "buildConvention": "PASS", "riskGate": "PASS", "jev": "PASS",
+                "sessionStartedClean": True,
+            }
+            with patch.dict(os.environ, {"CODEX_HARNESS_STATE_DIR": str(state_root)}):
+                ship_workflow.write_ship_state(target, "feat/auto-ship-e2e", head, attestation)
+
+            fake_bin = parent / "fake-bin"
+            fake_bin.mkdir()
+            gh_log = parent / "gh-cwds.jsonl"
+            gh = fake_bin / "gh"
+            metadata_fixture = json.dumps({
+                "headRefName": "feat/auto-ship-e2e", "headRefOid": head, "number": 6,
+                "state": "OPEN", "url": "https://github.com/dochiri0916/validation-lab/pull/6",
+            }, indent=2)
+            gh.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                f"with open({str(gh_log)!r}, 'a') as log: log.write(json.dumps({{'cwd': os.getcwd(), 'args': sys.argv[1:]}}) + '\\n')\n"
+                "args = sys.argv[1:]\n"
+                "if args[:3] == ['repo', 'view', 'dochiri0916/validation-lab']:\n"
+                "    print('main')\n"
+                "elif args[:3] == ['pr', 'view', '--repo']:\n"
+                f"    print({metadata_fixture!r})\n"
+                "else:\n"
+                "    sys.exit(9)\n"
+            )
+            gh.chmod(0o755)
+            real_git = subprocess.run(["which", "git"], check=True, capture_output=True, text=True).stdout.strip()
+            fake_git = fake_bin / "git"
+            git_log = parent / "git-commands.jsonl"
+            fake_git.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                f"with open({str(git_log)!r}, 'a') as log: log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                "if 'ls-remote' in sys.argv:\n"
+                f"    print({head!r} + '\\trefs/heads/feat/auto-ship-e2e')\n"
+                "    sys.exit(0)\n"
+                f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n"
+            )
+            fake_git.chmod(0o755)
+            home = parent / "home"
+            config = home / ".config/codex-harness/config.json"
+            config.parent.mkdir(parents=True)
+            config.write_text(json.dumps({"ship": {"enabled": True, "remote": "origin"}}))
+            env = os.environ.copy()
+            env.update({
+                "PATH": f"{fake_bin}:{env['PATH']}", "HOME": str(home),
+                "CODEX_HARNESS_STATE_DIR": str(state_root),
+            })
+            result = subprocess.run(
+                [str(ROOT / "bin" / "ship")], cwd=target, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["status"], "UPDATED")
+            self.assertEqual(payload["prNumber"], 6)
+            self.assertEqual(payload["prUrl"], "https://github.com/dochiri0916/validation-lab/pull/6")
+            self.assertEqual(git_output(target, "rev-parse", "HEAD"), original_head)
+            self.assertEqual(git_output(target, "status", "--porcelain", "--untracked-files=all"), "")
+            calls = [json.loads(line) for line in gh_log.read_text().splitlines()]
+            git_calls = [json.loads(line) for line in git_log.read_text().splitlines()]
+            self.assertTrue(calls)
+            self.assertTrue(all(call["cwd"] == str(target.resolve()) for call in calls))
+            self.assertFalse(any(call["args"][:2] == ["pr", "create"] for call in calls))
+            self.assertFalse(any("push" in call for call in git_calls))
+
+    def test_pull_request_accepts_compact_and_pretty_json_and_classifies_errors(self) -> None:
+        head = "7665584f50ff1fa863e16052de90c28fee7bfe19"
+        metadata = {
+            "headRefName": "feat/auto-ship-e2e", "headRefOid": head, "number": 6,
+            "state": "OPEN", "url": "https://github.com/dochiri0916/validation-lab/pull/6",
+        }
+        for output in (json.dumps(metadata), json.dumps(metadata, indent=2)):
+            with patch.object(ship_workflow.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "")):
+                self.assertEqual(ship_workflow.pull_request(self.root, "owner/repo", "feat/auto-ship-e2e", head)["prNumber"], 6)
+        with patch.object(ship_workflow.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "no pull requests found")):
+            with self.assertRaises(ship_workflow.ShipError) as error:
+                ship_workflow.pull_request(self.root, "owner/repo", "feat/auto-ship-e2e", head)
+            self.assertEqual(error.exception.category, "PR_NOT_FOUND")
+        with patch.object(ship_workflow.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "network unavailable")):
+            with self.assertRaises(ship_workflow.ShipError) as error:
+                ship_workflow.pull_request(self.root, "owner/repo", "feat/auto-ship-e2e", head)
+            self.assertEqual(error.exception.category, "GH_COMMAND_FAILED")
+        with patch.object(ship_workflow.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "{", "")):
+            with self.assertRaises(ship_workflow.ShipError) as error:
+                ship_workflow.pull_request(self.root, "owner/repo", "feat/auto-ship-e2e", head)
+            self.assertEqual(error.exception.category, "MALFORMED_PR_METADATA")
+
     def test_pass_attestation_commits_pushes_and_creates_pr(self) -> None:
         self.attest()
         result = ship_workflow.ship(self.root, "feat: ship safely", "Ship safely")
@@ -841,8 +943,9 @@ class ShipWorkflowTests(unittest.TestCase):
             "number": 8, "url": "https://github.com/owner/repo/pull/8",
             "state": "OPEN", "headRefName": "feat/ship", "headRefOid": "different",
         })
-        with self.assertRaisesRegex(ship_workflow.ShipError, "does not match"):
+        with self.assertRaisesRegex(ship_workflow.ShipError, "does not match") as error:
             ship_workflow.ship(self.root)
+        self.assertEqual(error.exception.category, "PR_HEAD_MISMATCH")
 
     def test_malformed_pr_json_is_rejected(self) -> None:
         self.attest()

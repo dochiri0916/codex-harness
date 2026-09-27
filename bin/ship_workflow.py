@@ -8,9 +8,14 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 from datetime import datetime, timezone
 
-import stop_verify
+HARNESS_ROOT = Path(__file__).resolve().parent.parent
+if str(HARNESS_ROOT) not in sys.path:
+    sys.path.insert(0, str(HARNESS_ROOT))
+
+from hooks import stop_verify
 import risk_gate_config
 
 

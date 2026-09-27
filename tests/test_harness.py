@@ -13,7 +13,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "hooks"))
 sys.path.insert(0, str(ROOT / "bin"))
-import stop_verify  # noqa: E402
+import hooks.stop_verify as stop_verify  # noqa: E402
 import turn_start  # noqa: E402
 import risk_gate_config  # noqa: E402
 import ship_workflow  # noqa: E402
@@ -707,6 +707,47 @@ class ShipWorkflowTests(unittest.TestCase):
 
     def assert_no_publication_mutations(self) -> None:
         self.assertFalse(any("push" in call or call[1:3] == ["pr", "create"] for call in self.calls))
+
+    def test_workflow_uses_the_shared_stop_hook_module(self) -> None:
+        self.assertIs(ship_workflow.stop_verify, stop_verify)
+        self.assertEqual(Path(ship_workflow.stop_verify.__file__).resolve(), ROOT / "hooks" / "stop_verify.py")
+
+    def test_ship_entrypoint_imports_from_harness_root(self) -> None:
+        with tempfile.TemporaryDirectory() as home_dir:
+            env = os.environ.copy()
+            env.pop("PYTHONPATH", None)
+            env["HOME"] = home_dir
+            result = subprocess.run(
+                [str(ROOT / "bin" / "ship")], cwd=ROOT, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertNotIn("ModuleNotFoundError", result.stderr + result.stdout)
+        self.assertIn("disabled", json.loads(result.stdout)["message"].lower())
+
+    def test_absolute_ship_entrypoint_runs_from_external_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as external_dir, tempfile.TemporaryDirectory() as home_dir:
+            external_root = Path(external_dir)
+            git(external_root, "init", "-q")
+            git(external_root, "config", "user.email", "harness@example.test")
+            git(external_root, "config", "user.name", "Harness Test")
+            (external_root / "README.md").write_text("external repository\n")
+            git(external_root, "add", "README.md")
+            git(external_root, "commit", "-qm", "initial")
+            head_before = git_output(external_root, "rev-parse", "HEAD")
+            env = os.environ.copy()
+            env.pop("PYTHONPATH", None)
+            env["HOME"] = home_dir
+            result = subprocess.run(
+                [str(ROOT / "bin" / "ship")], cwd=external_root, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("ModuleNotFoundError", result.stderr + result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertIn("disabled", payload["message"].lower())
+            self.assertEqual(git_output(external_root, "rev-parse", "HEAD"), head_before)
+            self.assertEqual(git_output(external_root, "status", "--porcelain"), "")
 
     def test_pass_attestation_commits_pushes_and_creates_pr(self) -> None:
         self.attest()

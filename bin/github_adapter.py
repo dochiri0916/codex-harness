@@ -26,7 +26,8 @@ def _json_command(root, *args: str, label: str) -> Any:
 def check_results(root, repo: str, sha: str) -> tuple[list[dict[str, Any]], bool]:
     """Return normalized check results and whether every result names this SHA."""
     runs = _json_command(
-        root, "api", f"repos/{repo}/commits/{sha}/check-runs", "-f", "per_page=100",
+        root, "api", "--method", "GET", "-H", "Accept: application/vnd.github+json",
+        f"repos/{repo}/commits/{sha}/check-runs", "-f", "per_page=100",
         label="check runs",
     )
     statuses = _json_command(

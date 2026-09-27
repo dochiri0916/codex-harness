@@ -57,7 +57,7 @@ class PRCheckTests(unittest.TestCase):
 
     def inspect(self, runs: list[dict[str, object]], statuses: list[dict[str, object]] | None = None):
         def fake_gh(_root, *args):
-            if "check-runs" in args[1]:
+            if any("check-runs" in arg for arg in args):
                 data = {"check_runs": runs}
             else:
                 data = {"statuses": statuses or []}
@@ -68,6 +68,22 @@ class PRCheckTests(unittest.TestCase):
                 patch.object(ship_workflow, "pull_request", return_value={"prNumber": 6}), \
                 patch.object(ship_workflow, "github", side_effect=fake_gh):
             return pr_check_workflow.inspect(self.root)
+
+    def test_check_runs_uses_explicit_get_and_accept_header(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def fake_gh(_root, *args):
+            calls.append(args)
+            data = {"check_runs": []} if any("check-runs" in arg for arg in args) else {"statuses": []}
+            return subprocess.CompletedProcess(["gh", *args], 0, json.dumps(data), "")
+
+        with patch.object(ship_workflow, "github", side_effect=fake_gh):
+            github_adapter.check_results(self.root, "owner/repo", self.head)
+
+        self.assertEqual(calls[0], (
+            "api", "--method", "GET", "-H", "Accept: application/vnd.github+json",
+            f"repos/owner/repo/commits/{self.head}/check-runs", "-f", "per_page=100",
+        ))
 
     def test_all_required_checks_success_returns_pass(self) -> None:
         payload, code = self.inspect([self.run_data("Risk Gate", head_sha=self.head)])
@@ -123,7 +139,7 @@ class PRCheckTests(unittest.TestCase):
                     pr_check_workflow.inspect(self.root)
         mismatched = self.run_data("Risk Gate", head_sha="f" * 40)
         def fake_gh(_root, *args):
-            data = {"check_runs": [mismatched]} if "check-runs" in args[1] else {"statuses": []}
+            data = {"check_runs": [mismatched]} if any("check-runs" in arg for arg in args) else {"statuses": []}
             return subprocess.CompletedProcess(["gh", *args], 0, json.dumps(data), "")
         with patch.object(ship_workflow, "github", side_effect=fake_gh):
             _rows, matches = github_adapter.check_results(self.root, "owner/repo", self.head)

@@ -140,7 +140,7 @@ PR_FIELDS = "number,url,state,headRefName,headRefOid"
 
 
 def pull_request(root: Path, repo: str, branch: str, head: str) -> dict[str, object]:
-    result = github(root, "pr", "view", "--repo", repo, "--json", PR_FIELDS)
+    result = github(root, "pr", "view", branch, "--repo", repo, "--json", PR_FIELDS)
     if result.returncode:
         diagnostic = result.stderr.lower()
         if "no pull requests found" in diagnostic or "could not find any pull requests" in diagnostic:

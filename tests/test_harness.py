@@ -798,7 +798,7 @@ class ShipWorkflowTests(unittest.TestCase):
                 "args = sys.argv[1:]\n"
                 "if args[:3] == ['repo', 'view', 'dochiri0916/validation-lab']:\n"
                 "    print('main')\n"
-                "elif args[:3] == ['pr', 'view', '--repo']:\n"
+                "elif args[:4] == ['pr', 'view', 'feat/auto-ship-e2e', '--repo']:\n"
                 f"    print({metadata_fixture!r})\n"
                 "else:\n"
                 "    sys.exit(9)\n"
@@ -852,8 +852,12 @@ class ShipWorkflowTests(unittest.TestCase):
             "state": "OPEN", "url": "https://github.com/dochiri0916/validation-lab/pull/6",
         }
         for output in (json.dumps(metadata), json.dumps(metadata, indent=2)):
-            with patch.object(ship_workflow.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "")):
+            with patch.object(ship_workflow.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "")) as run:
                 self.assertEqual(ship_workflow.pull_request(self.root, "owner/repo", "feat/auto-ship-e2e", head)["prNumber"], 6)
+                self.assertEqual(run.call_args.args[0], [
+                    "gh", "pr", "view", "feat/auto-ship-e2e", "--repo", "owner/repo",
+                    "--json", ship_workflow.PR_FIELDS,
+                ])
         with patch.object(ship_workflow.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "no pull requests found")):
             with self.assertRaises(ship_workflow.ShipError) as error:
                 ship_workflow.pull_request(self.root, "owner/repo", "feat/auto-ship-e2e", head)
@@ -880,7 +884,11 @@ class ShipWorkflowTests(unittest.TestCase):
         create = next(call for call in self.calls if call[1:3] == ["pr", "create"])
         self.assertIn("--base", create)
         self.assertIn("main", create)
-        self.assertTrue(any(call[1:3] == ["pr", "view"] and ship_workflow.PR_FIELDS in call for call in self.calls))
+        self.assertTrue(any(
+            call[1:4] == ["pr", "view", "feat/ship"] and "--repo" in call
+            and "owner/repo" in call and ship_workflow.PR_FIELDS in call
+            for call in self.calls
+        ))
 
     def test_existing_pr_is_reused_without_create(self) -> None:
         self.existing_pr = True
@@ -889,7 +897,10 @@ class ShipWorkflowTests(unittest.TestCase):
         self.assertEqual(result["status"], "UPDATED")
         self.assertEqual(result["prNumber"], 7)
         self.assertFalse(any(call[1:3] == ["pr", "create"] for call in self.calls))
-        self.assertTrue(any(call[1:3] == ["pr", "view"] for call in self.calls))
+        self.assertTrue(any(
+            call[1:4] == ["pr", "view", "feat/ship"] and "--repo" in call
+            for call in self.calls
+        ))
 
     def test_create_stdout_is_ignored_and_metadata_comes_from_json(self) -> None:
         self.attest()

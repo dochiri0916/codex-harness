@@ -77,6 +77,25 @@ def repository_snapshot(cwd: Path) -> tuple[str, dict[str, dict[str, object]]] |
         return None
 
 
+def repository_clean(root: Path) -> bool:
+    try:
+        return not git(root, "status", "--porcelain", "--untracked-files=all").strip()
+    except subprocess.CalledProcessError:
+        return False
+
+
+def session_clean_start(session_key: str, root: str, clean_now: bool) -> bool:
+    marker = state_dir() / f"{session_key}.session.json"
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        if payload.get("root") == root:
+            return payload.get("clean") is True
+    except (FileNotFoundError, OSError, json.JSONDecodeError, AttributeError):
+        pass
+    write_state(marker, {"root": root, "clean": clean_now})
+    return clean_now
+
+
 def write_state(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
@@ -124,12 +143,14 @@ def main() -> int:
             if result is None:
                 return 0
             root, files = result
+            clean_start = session_clean_start(session_key, root, repository_clean(Path(root)))
             write_state(path, {
                 "session_id": session_id,
                 "turn_id": turn_id,
                 "root": root,
                 "files": files,
                 "failures": 0,
+                "session_clean_start": clean_start,
             })
             try:
                 attempted_path.unlink()
@@ -171,12 +192,14 @@ def main() -> int:
                     previous.unlink()
                 except FileNotFoundError:
                     pass
+        clean_start = session_clean_start(session_key, root, repository_clean(Path(root)))
         write_state(path, {
             "session_id": session_id,
             "turn_id": turn_id,
             "root": root,
             "files": files,
             "failures": 0,
+            "session_clean_start": clean_start,
         })
         active_path.write_text(path.name, encoding="utf-8")
     except (ValueError, OSError, json.JSONDecodeError):

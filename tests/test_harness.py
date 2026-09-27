@@ -16,10 +16,18 @@ sys.path.insert(0, str(ROOT / "bin"))
 import stop_verify  # noqa: E402
 import turn_start  # noqa: E402
 import risk_gate_config  # noqa: E402
+import ship_workflow  # noqa: E402
 
 
 def git(root: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(root), *args], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def git_output(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(root), *args], check=True, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True,
+    ).stdout.strip()
 
 
 def make_repo(parent: Path) -> Path:
@@ -205,6 +213,23 @@ class HarnessTests(unittest.TestCase):
         check.assert_called_once_with(self.root.resolve())
         risk_gate.assert_called_once_with(self.root.resolve())
         self.assertEqual(result, {"systemMessage": "Gradle check passed. Local Risk Gate: PASS."})
+
+    def test_full_pass_writes_machine_local_attestation(self) -> None:
+        self.start_turn()
+        (self.root / "build/reports/build-convention/report.json").write_text('{"status":"PASS"}')
+        (self.root / "Main.java").write_text("class Main { int value = 1; }\n")
+        with patch.object(stop_verify, "run_check", return_value=(True, "")), \
+                patch.object(stop_verify, "run_risk_gate", return_value=("PASS", [], "", "PASS")):
+            invoke_stop(self.root)
+        import ship_workflow
+        attestation_path = ship_workflow.attestation_path(self.root)
+        attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+        self.assertNotEqual(attestation_path.parent, self.root)
+        self.assertEqual(attestation["validation"], "PASS")
+        self.assertEqual(attestation["riskGate"], "PASS")
+        self.assertEqual(attestation["jev"], "PASS")
+        self.assertEqual(attestation["buildConvention"], "PASS")
+        self.assertEqual(attestation["head"], git_output(self.root, "rev-parse", "HEAD"))
 
     def test_java_change_runs_check_and_passes_risk_interface(self) -> None:
         self.start_turn()
@@ -419,13 +444,13 @@ class HarnessTests(unittest.TestCase):
         config.parent.mkdir(parents=True)
         config.write_text(json.dumps({"jev": {"enabled": True, "keychainService": "fixture-service"}}))
         child_environment = {"TYPESAFE_API_KEY": "environment-fixture-key"}
-        with patch.dict(os.environ, {"HOME": str(home)}, clear=False), \
-                patch.object(risk_gate_config.subprocess, "run") as keychain:
+        with patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+            with patch.object(risk_gate_config.subprocess, "run") as keychain:
+                risk_gate_config.configure_jev_environment(child_environment)
+                keychain.assert_not_called()
+            self.assertEqual(child_environment["TYPESAFE_API_KEY"], "environment-fixture-key")
+            config.write_text(json.dumps({"jev": {"enabled": False}}))
             risk_gate_config.configure_jev_environment(child_environment)
-        self.assertEqual(child_environment["TYPESAFE_API_KEY"], "environment-fixture-key")
-        keychain.assert_not_called()
-        config.write_text(json.dumps({"jev": {"enabled": False}}))
-        risk_gate_config.configure_jev_environment(child_environment)
         self.assertNotIn("TYPESAFE_API_KEY", child_environment)
         self.assertEqual(child_environment["TYPESAFE_JEV_ENABLED"], "false")
 
@@ -621,6 +646,130 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("systemMessage", invoke_stop(self.root))
         self.assertNotEqual(self.state_root, self.root)
         self.assertFalse((self.root / ".codex-harness").exists())
+
+
+class ShipWorkflowTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.parent = Path(self.temp.name)
+        self.root = make_repo(self.parent)
+        git(self.root, "branch", "-m", "base")
+        git(self.root, "branch", "main", "HEAD")
+        git(self.root, "checkout", "-qB", "feat/ship")
+        git(self.root, "remote", "add", "origin", "git@github.com:owner/repo.git")
+        git(self.root, "update-ref", "refs/remotes/origin/main", "HEAD")
+        git(self.root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        self.state_root = self.parent / "outside-state"
+        self.home = self.parent / "home"
+        config = self.home / ".config/codex-harness/config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({"ship": {"enabled": True, "remote": "origin"}}))
+        self.env_patch = patch.dict(os.environ, {
+            "CODEX_HARNESS_STATE_DIR": str(self.state_root), "HOME": str(self.home),
+        })
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+        self.calls: list[list[str]] = []
+        self.existing_pr = False
+        self.default = "main"
+        self.real_run = subprocess.run
+        self.run_patch = patch.object(ship_workflow.subprocess, "run", side_effect=self.fake_run)
+        self.run_patch.start()
+        self.addCleanup(self.run_patch.stop)
+
+    def fake_run(self, args: list[str], *positional: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        args = [str(arg) for arg in args]
+        if args[0] == "git" and "push" in args:
+            self.calls.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args[0] == "gh":
+            self.calls.append(args)
+            if args[1:3] == ["repo", "view"]:
+                return subprocess.CompletedProcess(args, 0, self.default + "\n", "")
+            if args[1:3] == ["pr", "list"]:
+                body = '[{"number":7}]' if self.existing_pr else "[]"
+                return subprocess.CompletedProcess(args, 0, body, "")
+            if args[1:3] == ["pr", "create"]:
+                return subprocess.CompletedProcess(args, 0, "https://github.com/owner/repo/pull/8\n", "")
+            if args[1:3] == ["pr", "view"]:
+                return subprocess.CompletedProcess(args, 0, "8\n", "")
+        return self.real_run(args, *positional, **kwargs)  # type: ignore[return-value]
+
+    def attest(self, **overrides: object) -> None:
+        (self.root / "Main.java").write_text("class Main { int shipped = 1; }\n")
+        values: dict[str, object] = {
+            "build_status": "PASS", "risk_status": "PASS", "jev_status": "PASS",
+            "session_clean_start": True,
+        }
+        values.update(overrides)
+        ship_workflow.create_attestation(self.root, **values)  # type: ignore[arg-type]
+
+    def assert_no_publication_mutations(self) -> None:
+        self.assertFalse(any("push" in call or call[1:3] == ["pr", "create"] for call in self.calls))
+
+    def test_pass_attestation_commits_pushes_and_creates_pr(self) -> None:
+        self.attest()
+        result = ship_workflow.ship(self.root, "feat: ship safely", "Ship safely")
+        self.assertEqual(result["status"], "SHIPPED")
+        self.assertEqual(result["prNumber"], 8)
+        self.assertEqual(self.real_run(["git", "-C", str(self.root), "log", "-1", "--pretty=%s"], check=True, capture_output=True, text=True).stdout.strip(), "feat: ship safely")
+        push = next(call for call in self.calls if "push" in call)
+        self.assertIn("-u", push)
+        self.assertFalse(any(arg.startswith("--force") for arg in push))
+        create = next(call for call in self.calls if call[1:3] == ["pr", "create"])
+        self.assertIn("--base", create)
+        self.assertIn("main", create)
+
+    def test_existing_pr_is_reused_without_create(self) -> None:
+        self.existing_pr = True
+        self.attest()
+        result = ship_workflow.ship(self.root)
+        self.assertEqual(result["status"], "UPDATED")
+        self.assertEqual(result["prNumber"], 7)
+        self.assertFalse(any(call[1:3] == ["pr", "create"] for call in self.calls))
+
+    def test_changed_tree_is_stale_and_not_committed(self) -> None:
+        self.attest()
+        (self.root / "Main.java").write_text("changed after validation\n")
+        with self.assertRaisesRegex(ship_workflow.ShipError, "stale") as error:
+            ship_workflow.ship(self.root)
+        self.assertEqual(error.exception.code, 2)
+        self.assertEqual(self.real_run(["git", "-C", str(self.root), "log", "-1", "--pretty=%s"], check=True, capture_output=True, text=True).stdout.strip(), "initial")
+        self.assert_no_publication_mutations()
+
+    def test_default_branch_is_rejected_before_mutation(self) -> None:
+        git(self.root, "branch", "-f", "release", "HEAD")
+        self.default = "release"
+        git(self.root, "checkout", "-q", "release")
+        self.attest()
+        with self.assertRaisesRegex(ship_workflow.ShipError, "default branch"):
+            ship_workflow.ship(self.root)
+        self.assert_no_publication_mutations()
+
+    def test_main_branch_is_rejected_before_mutation(self) -> None:
+        git(self.root, "checkout", "-q", "main")
+        self.attest()
+        with self.assertRaisesRegex(ship_workflow.ShipError, "main or default"):
+            ship_workflow.ship(self.root)
+        self.assert_no_publication_mutations()
+
+    def test_risk_decisions_and_incomplete_jev_are_rejected(self) -> None:
+        for risk, jev, code in (("REVIEW", "PASS", 2), ("BLOCK", "PASS", 3),
+                                ("ERROR", "PASS", 4), ("PASS", "NOT_RUN", 2)):
+            with self.subTest(risk=risk, jev=jev):
+                (self.root / "Main.java").write_text(f"{risk} {jev}\n")
+                ship_workflow.create_attestation(self.root, "PASS", risk, jev, session_clean_start=True)
+                with self.assertRaises(ship_workflow.ShipError) as error:
+                    ship_workflow.ship(self.root)
+                self.assertEqual(error.exception.code, code)
+        self.assert_no_publication_mutations()
+
+    def test_dirty_session_start_is_rejected(self) -> None:
+        self.attest(session_clean_start=False)
+        with self.assertRaisesRegex(ship_workflow.ShipError, "clean when"):
+            ship_workflow.ship(self.root)
+        self.assert_no_publication_mutations()
 
 
 if __name__ == "__main__":

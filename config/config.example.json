@@ -3,5 +3,9 @@
   "jev": {
     "enabled": true,
     "keychainService": "risk-gate-typesafe-api-key"
+  },
+  "ship": {
+    "enabled": false,
+    "remote": "origin"
   }
 }

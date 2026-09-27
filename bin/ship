@@ -1,5 +1,31 @@
 #!/usr/bin/env python3
-"""Ship workflow interface placeholder; publishing policy is not configured."""
+"""Commit, push, and create or reuse a pull request after validation."""
 
-print("NOT_CONFIGURED: ship workflow")
-raise SystemExit(3)
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import sys
+
+from ship_workflow import ShipError, emit, ship
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--message", help="commit message")
+    parser.add_argument("--summary", help="short pull request summary")
+    args = parser.parse_args()
+    try:
+        result = ship(Path.cwd(), args.message, args.summary)
+    except ShipError as exc:
+        emit({"status": "ERROR", "message": str(exc)})
+        return exc.code
+    except (OSError, ValueError) as exc:
+        emit({"status": "ERROR", "message": f"Ship execution failed ({type(exc).__name__})."})
+        return 4
+    emit(result)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

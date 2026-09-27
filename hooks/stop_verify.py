@@ -14,6 +14,7 @@ import sys
 import tempfile
 
 HARNESS_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(HARNESS_ROOT / "bin"))
 POLICY = json.loads((HARNESS_ROOT / "config" / "policy.json").read_text(encoding="utf-8"))
 MAX_FAILURES = int(POLICY["max_consecutive_failures"])
 LOG_LIMIT = int(POLICY["failure_log_limit_chars"])
@@ -194,7 +195,7 @@ def run_check(root: Path) -> tuple[bool, str]:
     return False, f"{failure} (exit {result.returncode}). Fix the reported failure and rerun verification:\n{detail}"
 
 
-def run_risk_gate(root: Path) -> tuple[str, list[str], str]:
+def run_risk_gate(root: Path) -> tuple[str, list[str], str, str | None]:
     command = HARNESS_ROOT / "bin" / "risk-check"
     try:
         result = subprocess.run(
@@ -202,7 +203,7 @@ def run_risk_gate(root: Path) -> tuple[str, list[str], str]:
             stderr=subprocess.STDOUT, timeout=960, check=False, text=True,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return "ERROR", [], f"risk-check could not run ({type(exc).__name__})."
+        return "ERROR", [], f"risk-check could not run ({type(exc).__name__}).", None
     try:
         payload = json.loads(result.stdout)
         decision = payload.get("decision") if isinstance(payload, dict) else None
@@ -220,9 +221,11 @@ def run_risk_gate(root: Path) -> tuple[str, list[str], str]:
         if decision in ("NOT_CONFIGURED", "ERROR", "CONFIGURATION_ERROR") and result.returncode != 4:
             raise ValueError("exit code mismatch")
         message = payload.get("message", "")
-        return decision, reason_codes, message if isinstance(message, str) else ""
+        jev = payload.get("jev", {})
+        jev_status = jev.get("status") if isinstance(jev, dict) else None
+        return decision, reason_codes, message if isinstance(message, str) else "", jev_status
     except (json.JSONDecodeError, ValueError, AttributeError):
-        return "ERROR", [], "risk-check returned invalid output."
+        return "ERROR", [], "risk-check returned invalid output.", None
 
 
 def write_state(path: Path, payload: dict[str, object]) -> None:
@@ -243,6 +246,15 @@ def write_state(path: Path, payload: dict[str, object]) -> None:
 
 def emit(payload: dict[str, str] | dict[str, object]) -> None:
     print(json.dumps(payload, ensure_ascii=True))
+
+
+def write_attestation(root: Path, state: dict[str, object], build_status: str, jev_status: str) -> None:
+    from ship_workflow import create_attestation
+
+    create_attestation(
+        root, build_status, "PASS", jev_status,
+        session_clean_start=state.get("session_clean_start") is True,
+    )
 
 
 def main() -> int:
@@ -296,8 +308,17 @@ def main() -> int:
                 clear_state(state_path, session_id)
                 emit({"systemMessage": "Gradle check passed. Local Risk Gate: NEEDS_REVIEW (ERROR). Build Convention report is missing."})
                 return 0
-            decision, reason_codes, detail = run_risk_gate(root)
+            risk_result = run_risk_gate(root)
+            decision, reason_codes, detail = risk_result[:3]
+            jev_status = risk_result[3] if len(risk_result) > 3 else None
             if decision == "PASS":
+                try:
+                    report_payload = json.loads(report.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    report_payload = {}
+                build_status = report_payload.get("status") if isinstance(report_payload, dict) else None
+                if build_status == "PASS" and jev_status == "PASS":
+                    write_attestation(root, state, build_status, jev_status)
                 clear_state(state_path, session_id)
                 emit({"systemMessage": "Gradle check passed. Local Risk Gate: PASS."})
             elif decision == "BLOCK":

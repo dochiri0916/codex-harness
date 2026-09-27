@@ -81,7 +81,12 @@ def main() -> int:
             raise RuntimeError("unexpected process exit")
         if result.returncode != code_for[decision]:
             raise ValueError("exit code does not match decision")
-        return emit({"decision": decision, "reasonCodes": reason_codes}, result.returncode)
+        normalized = {"decision": decision, "reasonCodes": reason_codes}
+        if "buildConvention" in payload:
+            normalized["buildConvention"] = payload["buildConvention"]
+        if "jev" in payload:
+            normalized["jev"] = payload["jev"]
+        return emit(normalized, result.returncode)
     except (json.JSONDecodeError, ValueError, AttributeError, RuntimeError):
         message = "Local Risk Gate returned invalid output."
         if result.returncode not in (0, 2, 3, 4):

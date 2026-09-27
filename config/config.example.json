@@ -7,5 +7,10 @@
   "ship": {
     "enabled": false,
     "remote": "origin"
+  },
+  "prChecks": {
+    "required": [
+      "Risk Gate"
+    ]
   }
 }

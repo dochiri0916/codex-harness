@@ -24,7 +24,26 @@ def load_machine_config() -> dict[str, object]:
         raise ConfigurationError(f"Could not read {config_path}: {type(exc).__name__}.") from exc
     if not isinstance(config, dict):
         raise ConfigurationError(f"{config_path} must contain a JSON object.")
+    validate_pr_checks(config)
     return config
+
+
+def validate_pr_checks(config: dict[str, object]) -> list[str]:
+    """Validate and return configured required GitHub check names."""
+    if "prChecks" not in config:
+        return []
+    pr_checks = config["prChecks"]
+    if not isinstance(pr_checks, dict):
+        raise ConfigurationError("prChecks must be a JSON object.")
+    required = pr_checks.get("required")
+    if not isinstance(required, list) or not required:
+        raise ConfigurationError("prChecks.required must be a non-empty array of check names.")
+    if any(not isinstance(name, str) or not name.strip() for name in required):
+        raise ConfigurationError("prChecks.required must contain non-empty check names.")
+    normalized = [name.strip() for name in required]
+    if len(set(normalized)) != len(normalized):
+        raise ConfigurationError("prChecks.required must not contain duplicate check names.")
+    return normalized
 
 
 def _validated_home(value: object, source: str) -> Path:

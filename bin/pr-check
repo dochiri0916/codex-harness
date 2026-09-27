@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""Read and classify the required checks for the current open pull request."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import sys
+
+from pr_check_workflow import PRCheckError, inspect
+import github_adapter
+import risk_gate_config
+import ship_workflow
+
+
+def main() -> int:
+    try:
+        payload, code = inspect(Path.cwd())
+    except (PRCheckError, github_adapter.GitHubError, ship_workflow.ShipError,
+            risk_gate_config.ConfigurationError, OSError, ValueError) as exc:
+        message = str(exc)
+        message = github_adapter._safe_text(message)[:240]
+        payload, code = {"status": "ERROR", "message": message or "PR check inspection failed."}, 4
+    except Exception as exc:
+        payload, code = {"status": "ERROR", "message": f"PR check inspection failed ({type(exc).__name__})."}, 4
+    print(json.dumps(payload, separators=(",", ":")))
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -61,7 +61,7 @@ def _protocol(value: str) -> str | None:
 def _classify_failure(check: dict[str, Any], steps: list[str]) -> tuple[str, str, str]:
     name = check["name"]
     text = " ".join((check.get("summary", ""), check.get("text", ""), *steps))
-    combined = f"{name} {text}".lower()
+    combined = f"{name} {text}".lower().replace("-", " ")
     protocol = _protocol(text)
     if any(term in combined for term in ("infrastructure", "runner lost", "timed out waiting for", "service unavailable", "rate limit")):
         return "ERROR", "CI_INFRASTRUCTURE", "CI infrastructure failed."
@@ -154,6 +154,9 @@ def inspect(root: Path) -> tuple[dict[str, object], int]:
     failures: list[dict[str, object]] = []
     outcomes: list[str] = []
     for row in selected:
+        is_risk_gate_assess = row["name"].strip().lower() == "risk-gate / assess"
+        if is_risk_gate_assess and row["conclusion"] == "SUCCESS":
+            continue
         protocol_text = " ".join((row.get("summary", ""), row.get("text", "")))
         protocol = _protocol(protocol_text)
         if row["conclusion"] == "SUCCESS" and not (protocol in {"BLOCK", "REVIEW", "ERROR"}):
@@ -162,6 +165,18 @@ def inspect(root: Path) -> tuple[dict[str, object], int]:
             raise PRCheckError("A required check returned an invalid completed state.")
         steps = github_adapter.failure_steps(root, row.get("runId"))
         outcome, category, summary = _classify_failure(row, steps)
+        if is_risk_gate_assess and row["conclusion"] == "FAILURE" and category == "RISK_GATE":
+            decision = github_adapter.risk_gate_decision(root, row.get("runId"))
+            if decision == "BLOCK":
+                outcome, summary = "REPAIRABLE_FAILURE", "Risk Gate returned BLOCK."
+            elif decision == "REVIEW":
+                outcome, summary = "NEEDS_REVIEW", "Risk Gate requires human review."
+            elif decision == "ERROR":
+                outcome, summary = "ERROR", "Risk Gate execution failed."
+            elif decision == "PASS":
+                outcome, summary = "ERROR", "Risk Gate check failed despite a PASS decision."
+            else:
+                outcome, summary = "NEEDS_REVIEW", "Risk Gate outcome is unavailable."
         outcomes.append(outcome)
         failures.append(_failure_evidence(row, category, summary, steps))
     if not failures:

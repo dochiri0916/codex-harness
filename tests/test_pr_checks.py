@@ -69,6 +69,10 @@ class PRCheckTests(unittest.TestCase):
                 patch.object(ship_workflow, "github", side_effect=fake_gh):
             return pr_check_workflow.inspect(self.root)
 
+    def require_check(self, name: str) -> None:
+        config = self.home / ".config/codex-harness/config.json"
+        config.write_text(json.dumps({"prChecks": {"required": [name]}}))
+
     def test_check_runs_uses_explicit_get_and_accept_header(self) -> None:
         calls: list[tuple[str, ...]] = []
 
@@ -91,6 +95,13 @@ class PRCheckTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(payload["checks"][0]["conclusion"], "SUCCESS")
 
+    def test_risk_gate_assess_success_is_pass(self) -> None:
+        self.require_check("risk-gate / assess")
+        payload, code = self.inspect([self.run_data(
+            "risk-gate / assess", summary='{"decision":"BLOCK"}', head_sha=self.head,
+        )])
+        self.assertEqual((payload["status"], code), ("PASS", 0))
+
     def test_running_and_missing_required_checks_are_pending(self) -> None:
         payload, code = self.inspect([self.run_data("Risk Gate", status="in_progress", conclusion=None, head_sha=self.head)])
         self.assertEqual((payload["status"], code), ("PENDING", 1))
@@ -110,8 +121,89 @@ class PRCheckTests(unittest.TestCase):
         cases = (("BLOCK", "REPAIRABLE_FAILURE", 3), ("REVIEW", "NEEDS_REVIEW", 2), ("ERROR", "ERROR", 4))
         for decision, status, code in cases:
             with self.subTest(decision=decision):
-                payload, actual_code = self.inspect([self.run_data("Risk Gate", conclusion="failure", summary=f'{{"decision":"{decision}"}}', head_sha=self.head)])
+                self.require_check("risk-gate / assess")
+                row = self.run_data(
+                    "risk-gate / assess", conclusion="failure", summary="Risk Gate failed.",
+                    head_sha=self.head, details_url="https://github.com/owner/repo/actions/runs/123",
+                )
+                with patch.object(github_adapter, "risk_gate_decision", return_value=decision) as read_artifact:
+                    payload, actual_code = self.inspect([row])
                 self.assertEqual((payload["status"], actual_code), (status, code))
+                read_artifact.assert_called_once_with(self.root.resolve(), "123")
+                packet = payload.get("failures", payload.get("reasons"))[0]
+                self.assertNotIn("reasonCodes", packet)
+                if decision == "BLOCK":
+                    self.assertEqual(packet["summary"], "Risk Gate returned BLOCK.")
+
+    def test_risk_gate_pass_artifact_conflicting_with_failure_is_error(self) -> None:
+        self.require_check("risk-gate / assess")
+        row = self.run_data(
+            "risk-gate / assess", conclusion="failure", head_sha=self.head,
+            details_url="https://github.com/owner/repo/actions/runs/123",
+        )
+        with patch.object(github_adapter, "risk_gate_decision", return_value="PASS"):
+            payload, code = self.inspect([row])
+        self.assertEqual((payload["status"], code), ("ERROR", 4))
+
+    def test_missing_or_invalid_risk_gate_artifact_is_not_repairable(self) -> None:
+        self.require_check("risk-gate / assess")
+        row = self.run_data(
+            "risk-gate / assess", conclusion="failure", head_sha=self.head,
+            details_url="https://github.com/owner/repo/actions/runs/123",
+        )
+        for decision in (None, "UNKNOWN"):
+            with self.subTest(decision=decision), patch.object(
+                    github_adapter, "risk_gate_decision", return_value=decision):
+                payload, code = self.inspect([row])
+                self.assertEqual((payload["status"], code), ("NEEDS_REVIEW", 2))
+
+    def test_stale_check_sha_stops_before_risk_gate_artifact_read(self) -> None:
+        self.require_check("risk-gate / assess")
+        row = self.run_data(
+            "risk-gate / assess", conclusion="failure", head_sha="f" * 40,
+            details_url="https://github.com/owner/repo/actions/runs/123",
+        )
+        with patch.object(github_adapter, "risk_gate_decision") as read_artifact:
+            with self.assertRaisesRegex(pr_check_workflow.PRCheckError, "different HEAD SHA"):
+                self.inspect([row])
+        read_artifact.assert_not_called()
+
+    def test_risk_gate_artifact_download_uses_run_and_cleans_temp_directory(self) -> None:
+        calls: list[tuple[str, ...]] = []
+        temp_paths: list[Path] = []
+
+        def fake_gh(_root, *args):
+            calls.append(args)
+            destination = Path(args[-1])
+            temp_paths.append(destination)
+            response = destination / "risk-gate" / "response.json"
+            response.parent.mkdir(parents=True)
+            response.write_text('{"decision":"BLOCK","reasonCodes":["TEST"],"score":0}')
+            return subprocess.CompletedProcess(["gh", *args], 0, "", "")
+
+        with patch.object(ship_workflow, "github", side_effect=fake_gh):
+            decision = github_adapter.risk_gate_decision(self.root, "36323100566")
+
+        self.assertEqual(decision, "BLOCK")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:5], (
+            "run", "download", "36323100566", "-n", "risk-gate-reports",
+        ))
+        self.assertEqual(calls[0][5], "-D")
+        self.assertFalse(temp_paths[0].exists())
+
+    def test_malformed_or_missing_risk_gate_response_is_unavailable(self) -> None:
+        for content in (None, "{malformed", '{"decision":"UNKNOWN"}'):
+            with self.subTest(content=content):
+                def fake_gh(_root, *args):
+                    if content is not None:
+                        response = Path(args[-1]) / "risk-gate" / "response.json"
+                        response.parent.mkdir(parents=True)
+                        response.write_text(content)
+                    return subprocess.CompletedProcess(["gh", *args], 0, "", "")
+
+                with patch.object(ship_workflow, "github", side_effect=fake_gh):
+                    self.assertIsNone(github_adapter.risk_gate_decision(self.root, "123"))
 
     def test_jev_review_requires_human_review(self) -> None:
         config = self.home / ".config/codex-harness/config.json"

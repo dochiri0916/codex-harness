@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+import tempfile
+from pathlib import Path
 from typing import Any
 
 import ship_workflow
@@ -127,6 +129,31 @@ def failure_steps(root, run_id: str | None) -> list[str]:
         ] if isinstance(steps, list) else []
         failed.extend(names or ([job["name"]] if isinstance(job.get("name"), str) else []))
     return [_safe_text(name)[:120] for name in failed[:8]]
+
+
+def risk_gate_decision(root, run_id: str | None) -> str | None:
+    """Read the structured decision from one Actions run's Risk Gate artifact."""
+    if not run_id or not re.fullmatch(r"\d+", run_id):
+        return None
+    try:
+        with tempfile.TemporaryDirectory(prefix="codex-harness-risk-gate-") as directory:
+            result = ship_workflow.github(
+                root, "run", "download", run_id, "-n", "risk-gate-reports", "-D", directory,
+            )
+            if result.returncode:
+                return None
+            response_path = Path(directory) / "risk-gate" / "response.json"
+            if response_path.is_symlink() or not response_path.is_file() or response_path.stat().st_size > 64 * 1024:
+                return None
+            payload = json.loads(response_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    decision = payload.get("decision")
+    if not isinstance(decision, str) or decision not in {"BLOCK", "REVIEW", "ERROR", "PASS"}:
+        return None
+    return decision
 
 
 def _safe_text(value: object) -> str:

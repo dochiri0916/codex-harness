@@ -673,6 +673,9 @@ class ShipWorkflowTests(unittest.TestCase):
         self.calls: list[list[str]] = []
         self.existing_pr = False
         self.default = "main"
+        self.pushed_head: str | None = None
+        self.view_output: str | None = None
+        self.view_returncode = 0
         self.real_run = subprocess.run
         self.run_patch = patch.object(ship_workflow.subprocess, "run", side_effect=self.fake_run)
         self.run_patch.start()
@@ -682,7 +685,12 @@ class ShipWorkflowTests(unittest.TestCase):
         args = [str(arg) for arg in args]
         if args[0] == "git" and "push" in args:
             self.calls.append(args)
+            self.pushed_head = git_output(self.root, "rev-parse", "HEAD")
             return subprocess.CompletedProcess(args, 0, "", "")
+        if args[0] == "git" and "ls-remote" in args:
+            self.calls.append(args)
+            body = f"{self.pushed_head}\trefs/heads/feat/ship\n" if self.pushed_head else ""
+            return subprocess.CompletedProcess(args, 0, body, "")
         if args[0] == "gh":
             self.calls.append(args)
             if args[1:3] == ["repo", "view"]:
@@ -693,7 +701,15 @@ class ShipWorkflowTests(unittest.TestCase):
             if args[1:3] == ["pr", "create"]:
                 return subprocess.CompletedProcess(args, 0, "https://github.com/owner/repo/pull/8\n", "")
             if args[1:3] == ["pr", "view"]:
-                return subprocess.CompletedProcess(args, 0, "8\n", "")
+                body = self.view_output
+                if body is None:
+                    body = json.dumps({
+                        "number": 8 if not self.existing_pr else 7,
+                        "url": f"https://github.com/owner/repo/pull/{8 if not self.existing_pr else 7}",
+                        "state": "OPEN", "headRefName": "feat/ship",
+                        "headRefOid": git_output(self.root, "rev-parse", "HEAD"),
+                    })
+                return subprocess.CompletedProcess(args, self.view_returncode, body, "")
         return self.real_run(args, *positional, **kwargs)  # type: ignore[return-value]
 
     def attest(self, **overrides: object) -> None:
@@ -754,6 +770,7 @@ class ShipWorkflowTests(unittest.TestCase):
         result = ship_workflow.ship(self.root, "feat: ship safely", "Ship safely")
         self.assertEqual(result["status"], "SHIPPED")
         self.assertEqual(result["prNumber"], 8)
+        self.assertEqual(result["prUrl"], "https://github.com/owner/repo/pull/8")
         self.assertEqual(self.real_run(["git", "-C", str(self.root), "log", "-1", "--pretty=%s"], check=True, capture_output=True, text=True).stdout.strip(), "feat: ship safely")
         push = next(call for call in self.calls if "push" in call)
         self.assertIn("-u", push)
@@ -761,6 +778,7 @@ class ShipWorkflowTests(unittest.TestCase):
         create = next(call for call in self.calls if call[1:3] == ["pr", "create"])
         self.assertIn("--base", create)
         self.assertIn("main", create)
+        self.assertTrue(any(call[1:3] == ["pr", "view"] and ship_workflow.PR_FIELDS in call for call in self.calls))
 
     def test_existing_pr_is_reused_without_create(self) -> None:
         self.existing_pr = True
@@ -769,6 +787,68 @@ class ShipWorkflowTests(unittest.TestCase):
         self.assertEqual(result["status"], "UPDATED")
         self.assertEqual(result["prNumber"], 7)
         self.assertFalse(any(call[1:3] == ["pr", "create"] for call in self.calls))
+        self.assertTrue(any(call[1:3] == ["pr", "view"] for call in self.calls))
+
+    def test_create_stdout_is_ignored_and_metadata_comes_from_json(self) -> None:
+        self.attest()
+        self.view_output = json.dumps({
+            "number": 42, "url": "https://github.com/owner/repo/pull/42",
+            "state": "OPEN", "headRefName": "feat/ship",
+            "headRefOid": "",  # filled below after the commit
+        })
+        original = self.fake_run
+
+        def run_with_head(args: list[str], *positional: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            result = original(args, *positional, **kwargs)
+            if args[0] == "gh" and args[1:3] == ["pr", "view"]:
+                payload = json.loads(result.stdout)
+                payload["headRefOid"] = git_output(self.root, "rev-parse", "HEAD")
+                result.stdout = json.dumps(payload)
+            return result
+
+        with patch.object(ship_workflow.subprocess, "run", side_effect=run_with_head):
+            result = ship_workflow.ship(self.root)
+        self.assertEqual(result["prNumber"], 42)
+        create = next(call for call in self.calls if call[1:3] == ["pr", "create"])
+        self.assertNotIn("--json", create)
+
+    def test_metadata_failure_recovers_without_duplicate_commit_or_pr(self) -> None:
+        self.attest()
+        self.view_output = "not json"
+        with self.assertRaisesRegex(ship_workflow.ShipError, "invalid pull request data"):
+            ship_workflow.ship(self.root)
+        committed = git_output(self.root, "rev-parse", "HEAD")
+        self.assertTrue((self.root / "Main.java").read_text().startswith("class Main"))
+        self.view_output = None
+        self.calls.clear()
+        result = ship_workflow.ship(self.root)
+        self.assertEqual(result["status"], "UPDATED")
+        self.assertEqual(git_output(self.root, "rev-parse", "HEAD"), committed)
+        self.assertFalse(any("push" in call or call[1:3] == ["pr", "create"] for call in self.calls))
+
+    def test_clean_pushed_branch_with_matching_open_pr_recovers_legacy_partial_ship(self) -> None:
+        head = git_output(self.root, "rev-parse", "HEAD")
+        self.pushed_head = head
+        self.existing_pr = True
+        result = ship_workflow.ship(self.root)
+        self.assertEqual(result["status"], "UPDATED")
+        self.assertEqual(result["commit"], head[:12])
+        self.assertFalse(any("push" in call or call[1:3] == ["pr", "create"] for call in self.calls))
+
+    def test_pull_request_head_mismatch_is_rejected(self) -> None:
+        self.attest()
+        self.view_output = json.dumps({
+            "number": 8, "url": "https://github.com/owner/repo/pull/8",
+            "state": "OPEN", "headRefName": "feat/ship", "headRefOid": "different",
+        })
+        with self.assertRaisesRegex(ship_workflow.ShipError, "does not match"):
+            ship_workflow.ship(self.root)
+
+    def test_malformed_pr_json_is_rejected(self) -> None:
+        self.attest()
+        self.view_output = "{"
+        with self.assertRaisesRegex(ship_workflow.ShipError, "invalid pull request data"):
+            ship_workflow.ship(self.root)
 
     def test_changed_tree_is_stale_and_not_committed(self) -> None:
         self.attest()

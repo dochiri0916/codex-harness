@@ -49,6 +49,10 @@ def attestation_path(root: Path) -> Path:
     return stop_verify.state_dir() / f"validation-{repository_identity(root)}.json"
 
 
+def ship_state_path(root: Path) -> Path:
+    return stop_verify.state_dir() / f"ship-{repository_identity(root)}.json"
+
+
 def create_attestation(
     root: Path, build_status: str, risk_status: str, jev_status: str,
     *, session_clean_start: bool,
@@ -126,6 +130,87 @@ def safe_summary(value: str) -> str:
     return value.strip()
 
 
+PR_FIELDS = "number,url,state,headRefName,headRefOid"
+
+
+def pull_request(root: Path, repo: str, branch: str, head: str) -> dict[str, object]:
+    result = subprocess.run(
+        ["gh", "pr", "view", "--repo", repo, "--json", PR_FIELDS],
+        cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
+    )
+    if result.returncode:
+        raise ShipError("Could not read pull request metadata.")
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ShipError("GitHub CLI returned invalid pull request data.") from exc
+    if not isinstance(data, dict):
+        raise ShipError("GitHub CLI returned invalid pull request data.")
+    number, url = data.get("number"), data.get("url")
+    if not isinstance(number, int) or isinstance(number, bool) or not isinstance(url, str) or not url.strip():
+        raise ShipError("GitHub CLI returned incomplete pull request metadata.")
+    if data.get("state") != "OPEN" or data.get("headRefName") != branch or data.get("headRefOid") != head:
+        raise ShipError("Pull request state or head does not match the pushed branch.")
+    return {"prNumber": number, "prUrl": url}
+
+
+def remote_head(root: Path, remote: str, branch: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(root), "ls-remote", "--heads", remote, f"refs/heads/{branch}"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+    )
+    if result.returncode:
+        raise ShipError("Could not inspect the remote branch.")
+    fields = result.stdout.strip().split()
+    if len(fields) != 2 or fields[1] != f"refs/heads/{branch}":
+        raise ShipError("Remote branch does not match the recorded ship state.")
+    return fields[0]
+
+
+def write_ship_state(root: Path, branch: str, head: str, attestation: dict[str, object]) -> None:
+    path = ship_state_path(root)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps({
+        "repositoryIdentity": repository_identity(root), "branch": branch,
+        "pushedHead": head, "validation": "PASS", "attestation": attestation,
+    }, separators=(",", ":")) + "\n", encoding="utf-8")
+    os.chmod(temp, 0o600)
+    temp.replace(path)
+
+
+def recover_partial_ship(root: Path, repo: str, remote: str, branch: str, head: str) -> dict[str, object]:
+    try:
+        state = json.loads(ship_state_path(root).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        state = None
+    except json.JSONDecodeError as exc:
+        raise ShipError("Partial ship state is invalid.") from exc
+    if state is None:
+        if git(root, "status", "--porcelain", "--untracked-files=all"):
+            raise ShipError("Partial ship recovery requires a clean working tree.")
+        if remote_head(root, remote, branch) != head:
+            raise ShipError("Remote branch does not match the current HEAD.")
+        pr = pull_request(root, repo, branch, head)
+        return {"status": "UPDATED", "branch": branch, "commit": head[:12], **pr}
+    validation = state.get("attestation") if isinstance(state, dict) else None
+    if (not isinstance(state, dict) or state.get("repositoryIdentity") != repository_identity(root)
+            or state.get("branch") != branch or state.get("pushedHead") != head
+            or state.get("validation") != "PASS" or not isinstance(validation, dict)
+            or validation.get("repositoryIdentity") != repository_identity(root)
+            or validation.get("branch") != branch or validation.get("validation") != "PASS"
+            or validation.get("buildConvention") != "PASS" or validation.get("riskGate") != "PASS"
+            or validation.get("jev") != "PASS" or validation.get("sessionStartedClean") is not True):
+        raise ShipError("No matching partial ship state exists.", 2)
+    if git(root, "status", "--porcelain", "--untracked-files=all"):
+        raise ShipError("Partial ship recovery requires a clean working tree.")
+    if remote_head(root, remote, branch) != head:
+        raise ShipError("Remote branch does not match the recorded ship state.")
+    pr = pull_request(root, repo, branch, head)
+    ship_state_path(root).unlink(missing_ok=True)
+    return {"status": "UPDATED", "branch": branch, "commit": head[:12], **pr}
+
+
 def ship(root: Path, message: str | None = None, summary: str | None = None) -> dict[str, object]:
     root = Path(git(root, "rev-parse", "--show-toplevel")).resolve()
     config = load_config()
@@ -139,9 +224,13 @@ def ship(root: Path, message: str | None = None, summary: str | None = None) -> 
         raise ShipError("Automatic ship is disabled on the main or default branch.")
     attestation_file = attestation_path(root)
     try:
-        attestation = json.loads(attestation_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ShipError("No successful validation attestation exists.", 2) from exc
+        attestation_text = attestation_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return recover_partial_ship(root, repo, str(remote), branch, git(root, "rev-parse", "HEAD"))
+    try:
+        attestation = json.loads(attestation_text)
+    except json.JSONDecodeError as exc:
+        raise ShipError("Validation attestation is invalid.") from exc
     if not isinstance(attestation, dict):
         raise ShipError("Validation attestation is invalid.")
     head = git(root, "rev-parse", "HEAD")
@@ -193,6 +282,7 @@ def ship(root: Path, message: str | None = None, summary: str | None = None) -> 
     result = subprocess.run(push_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
     if result.returncode:
         raise ShipError("Git push failed.")
+    write_ship_state(root, branch, commit, attestation)
     existing = subprocess.run(
         ["gh", "pr", "list", "--repo", repo, "--head", branch, "--state", "open", "--json", "number", "--limit", "1"],
         cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
@@ -204,10 +294,8 @@ def ship(root: Path, message: str | None = None, summary: str | None = None) -> 
     except json.JSONDecodeError as exc:
         raise ShipError("GitHub CLI returned invalid pull request data.") from exc
     if prs:
-        number = prs[0].get("number")
-        if not isinstance(number, int):
-            raise ShipError("GitHub CLI returned an invalid pull request number.")
-        return {"status": "UPDATED", "branch": branch, "commit": commit[:12], "prNumber": number}
+        pr = pull_request(root, repo, branch, commit)
+        return {"status": "UPDATED", "branch": branch, "commit": commit[:12], **pr}
     title = safe_summary(summary or message or "Complete Codex goal").splitlines()[0][:120]
     if not title:
         title = "Complete Codex goal"
@@ -222,12 +310,6 @@ def ship(root: Path, message: str | None = None, summary: str | None = None) -> 
     )
     if created.returncode:
         raise ShipError("Pull request creation failed.")
-    viewed = subprocess.run(
-        ["gh", "pr", "view", "--repo", repo, "--json", "number", "--jq", ".number"],
-        cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
-    )
-    try:
-        number = int(viewed.stdout.strip())
-    except ValueError as exc:
-        raise ShipError("Created pull request number could not be read.") from exc
-    return {"status": "SHIPPED", "branch": branch, "commit": commit[:12], "prNumber": number}
+    pr = pull_request(root, repo, branch, commit)
+    ship_state_path(root).unlink(missing_ok=True)
+    return {"status": "SHIPPED", "branch": branch, "commit": commit[:12], **pr}

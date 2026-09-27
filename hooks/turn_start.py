@@ -108,7 +108,42 @@ def main() -> int:
         session_key = hashlib.sha256(session_id.encode("utf-8", "surrogatepass")).hexdigest()
         key = state_key(session_id, turn_id)
         path = state_dir() / f"{key}.json"
+        attempted_path = state_dir() / f"{key}.mutating-tool"
         active_path = state_dir() / f"{session_key}.active"
+        tool_name = event.get("tool_name")
+        if isinstance(tool_name, str):
+            # PreToolUse is the reliable start point for continuation turns. Mark
+            # the attempt first so Stop can distinguish a read-only turn from a
+            # failed snapshot of a mutating-capable tool.
+            attempted_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fd = os.open(attempted_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(fd)
+            if path.is_file():
+                return 0
+            result = repository_snapshot(Path(cwd))
+            if result is None:
+                return 0
+            root, files = result
+            write_state(path, {
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "root": root,
+                "files": files,
+                "failures": 0,
+            })
+            try:
+                attempted_path.unlink()
+            except FileNotFoundError:
+                pass
+            if active_path.is_file():
+                previous = state_dir() / active_path.read_text(encoding="utf-8").strip()
+                if previous != path:
+                    try:
+                        previous.unlink()
+                    except FileNotFoundError:
+                        pass
+            active_path.write_text(path.name, encoding="utf-8")
+            return 0
         retry_marker = f"[[CODEX_HARNESS_RETRY:{session_key[:12]}]]"
         prompt = event.get("prompt")
         if isinstance(prompt, str) and prompt.startswith(retry_marker) and active_path.is_file():
@@ -127,6 +162,8 @@ def main() -> int:
         if result is None:
             return 0
         root, files = result
+        if path.is_file():
+            return 0
         if active_path.is_file():
             previous = state_dir() / active_path.read_text(encoding="utf-8").strip()
             if previous != path:

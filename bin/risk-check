@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 
-from risk_gate_config import ConfigurationError, resolve_risk_gate_home
+from risk_gate_config import ConfigurationError, configure_jev_environment, resolve_risk_gate_home
 
 
 def emit(payload: dict[str, object], code: int) -> int:
@@ -23,6 +24,13 @@ def main() -> int:
         return emit({"decision": "ERROR", "message": str(exc)}, 4)
     if home is None:
         return emit({"decision": "NOT_CONFIGURED", "message": "Configure riskGateHome in ~/.config/codex-harness/config.json or set RISK_GATE_HOME."}, 4)
+    child_environment = os.environ.copy()
+    try:
+        configure_jev_environment(child_environment)
+    except ConfigurationError as exc:
+        # Configuration failures are deliberately generic: never include a
+        # Keychain value or the output of the `security` command.
+        return emit({"decision": "CONFIGURATION_ERROR", "message": str(exc)}, 4)
     try:
         root = Path(subprocess.run(
             ["git", "rev-parse", "--show-toplevel"], check=True,
@@ -35,11 +43,14 @@ def main() -> int:
     if not report.is_file():
         return emit({"decision": "ERROR", "message": "Build Convention report is missing."}, 4)
 
+    build_environment = os.environ.copy()
+    build_environment.pop("TYPESAFE_API_KEY", None)
+    build_environment.pop("TYPESAFE_JEV_ENABLED", None)
     try:
         subprocess.run(
             [str(home / "gradlew"), "-p", str(home), "--quiet", "bootJar"],
             cwd=home, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            timeout=900, check=True,
+            timeout=900, check=True, env=build_environment,
         )
         jars = sorted((home / "build" / "libs").glob("*.jar"))
         executable_jars = [jar for jar in jars if not jar.name.endswith("-plain.jar")]
@@ -51,13 +62,16 @@ def main() -> int:
     try:
         result = subprocess.run(
             ["java", "-jar", str(executable_jars[0]), "local", "--project", str(root)],
-            cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=900, check=False,
+            cwd=root, env=child_environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=900, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return emit({"decision": "ERROR", "message": f"Local Risk Gate could not run ({type(exc).__name__})."}, 4)
 
+    api_key = child_environment.get("TYPESAFE_API_KEY")
+    stdout = result.stdout.replace(api_key, "[REDACTED]") if api_key else result.stdout
+    stderr = result.stderr.replace(api_key, "[REDACTED]") if api_key else result.stderr
     try:
-        payload = json.loads(result.stdout)
+        payload = json.loads(stdout)
         decision = payload.get("decision") if isinstance(payload, dict) else None
         reason_codes = payload.get("reasonCodes", []) if isinstance(payload, dict) else None
         code_for = {"PASS": 0, "REVIEW": 2, "BLOCK": 3, "ERROR": 4}
@@ -72,7 +86,7 @@ def main() -> int:
         message = "Local Risk Gate returned invalid output."
         if result.returncode not in (0, 2, 3, 4):
             message = f"Local Risk Gate execution failed (exit {result.returncode})."
-            cli_errors = [line.strip() for line in result.stderr.splitlines()
+            cli_errors = [line.strip() for line in stderr.splitlines()
                           if line.strip().startswith(("Local Risk Gate error:", "Local Risk Gate failed"))]
             if cli_errors:
                 message += " " + cli_errors[-1][:300]

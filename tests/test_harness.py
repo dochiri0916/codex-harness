@@ -12,8 +12,10 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "hooks"))
+sys.path.insert(0, str(ROOT / "bin"))
 import stop_verify  # noqa: E402
 import turn_start  # noqa: E402
+import risk_gate_config  # noqa: E402
 
 
 def git(root: Path, *args: str) -> None:
@@ -57,11 +59,31 @@ def invoke_stop(root: Path) -> dict[str, object]:
     return json.loads(output.getvalue())
 
 
+def invoke_stop_for_turn(root: Path, turn_id: str) -> dict[str, object]:
+    from io import StringIO
+    import contextlib
+
+    event = {"session_id": "session-1", "turn_id": turn_id, "cwd": str(root)}
+    output = StringIO()
+    with patch.object(sys, "stdin", StringIO(json.dumps(event))), contextlib.redirect_stdout(output):
+        stop_verify.main()
+    return json.loads(output.getvalue())
+
+
 def invoke_start(root: Path, prompt: str) -> None:
     from io import StringIO
     import contextlib
 
     event = {"session_id": "session-1", "turn_id": "turn-retry", "cwd": str(root), "prompt": prompt}
+    with patch.object(sys, "stdin", StringIO(json.dumps(event))), contextlib.redirect_stdout(StringIO()):
+        turn_start.main()
+
+
+def invoke_pretool(root: Path, tool_name: str, turn_id: str = "continuation-turn") -> None:
+    from io import StringIO
+    import contextlib
+
+    event = {"session_id": "session-1", "turn_id": turn_id, "cwd": str(root), "tool_name": tool_name}
     with patch.object(sys, "stdin", StringIO(json.dumps(event))), contextlib.redirect_stdout(StringIO()):
         turn_start.main()
 
@@ -295,7 +317,7 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(result, {"systemMessage": "Hook · Gradle check passed.\nLocal Risk Gate: NEEDS_REVIEW (REVIEW)."})
         self.assertNotIn("decision", result)
 
-    def test_turn_snapshot_is_scoped_by_session_and_turn_and_cleaned_on_terminal_stop(self) -> None:
+    def test_general_question_without_snapshot_is_normal_completion(self) -> None:
         start_turn = {"session_id": "session-1", "turn_id": "turn-a", "cwd": str(self.root)}
         from io import StringIO
         import contextlib
@@ -309,9 +331,40 @@ class HarnessTests(unittest.TestCase):
         with patch.object(sys, "stdin", StringIO(json.dumps(stop_event))), contextlib.redirect_stdout(output):
             stop_verify.main()
         result = json.loads(output.getvalue())
-        self.assertIn("NEEDS_REVIEW", result["systemMessage"])
-        self.assertIn("no snapshot for this turn", result["systemMessage"])
+        self.assertEqual(result, {})
         self.assertTrue(path_a.is_file())
+
+    def test_pretool_snapshots_continuation_before_apply_patch_and_detects_change(self) -> None:
+        invoke_pretool(self.root, "apply_patch")
+        state_path = self.state_root / f"{turn_start.state_key('session-1', 'continuation-turn')}.json"
+        self.assertTrue(state_path.is_file())
+        (self.root / "Main.java").write_text("class Main { int changed = 1; }\n")
+        with patch.object(stop_verify, "run_check", return_value=(True, "")) as check, \
+                patch.object(stop_verify, "run_risk_gate", return_value=("PASS", [], "")):
+            result = invoke_stop_for_turn(self.root, "continuation-turn")
+        check.assert_called_once_with(self.root.resolve())
+        self.assertEqual(result, {"systemMessage": "Gradle check passed. Local Risk Gate: PASS."})
+
+    def test_pretool_snapshots_before_bash_file_change(self) -> None:
+        invoke_pretool(self.root, "Bash", "bash-turn")
+        (self.root / "Main.java").write_text("class Main { int changed = 1; }\n")
+        with patch.object(stop_verify, "run_check", return_value=(True, "")) as check, \
+                patch.object(stop_verify, "run_risk_gate", return_value=("PASS", [], "")):
+            result = invoke_stop_for_turn(self.root, "bash-turn")
+        check.assert_called_once_with(self.root.resolve())
+        self.assertEqual(result["systemMessage"], "Gradle check passed. Local Risk Gate: PASS.")
+
+    def test_failed_pretool_snapshot_is_needs_review(self) -> None:
+        import contextlib
+        from io import StringIO
+
+        with patch.object(turn_start, "repository_snapshot", return_value=None):
+            invoke_pretool(self.root, "Write", "failed-snapshot-turn")
+        output = StringIO()
+        event = {"session_id": "session-1", "turn_id": "failed-snapshot-turn", "cwd": str(self.root)}
+        with patch.object(sys, "stdin", StringIO(json.dumps(event))), contextlib.redirect_stdout(output):
+            stop_verify.main()
+        self.assertIn("NEEDS_REVIEW", json.loads(output.getvalue())["systemMessage"])
 
     def test_stop_hook_uses_machine_config_without_risk_gate_environment(self) -> None:
         self.start_turn()
@@ -341,6 +394,96 @@ class HarnessTests(unittest.TestCase):
             os.environ.pop("RISK_GATE_HOME", None)
             result = invoke_stop(self.root)
         self.assertEqual(result, {"systemMessage": "Gradle check passed. Local Risk Gate: PASS."})
+
+    def test_jev_keychain_lookup_is_private_and_passes_configured_environment(self) -> None:
+        home = self.parent / "machine-home-jev"
+        config = home / ".config" / "codex-harness" / "config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({"jev": {"enabled": True, "keychainService": "fixture-service"}}))
+        child_environment: dict[str, str] = {}
+        keychain_result = subprocess.CompletedProcess(
+            args=["security"], returncode=0, stdout="fixture-only-key-material\n", stderr=""
+        )
+        with patch.dict(os.environ, {"HOME": str(home)}, clear=False), \
+                patch.dict(os.environ, {"TYPESAFE_API_KEY": ""}, clear=False), \
+                patch.object(risk_gate_config.sys, "platform", "darwin"), \
+                patch.object(risk_gate_config.subprocess, "run", return_value=keychain_result) as keychain:
+            risk_gate_config.configure_jev_environment(child_environment)
+        self.assertEqual(child_environment["TYPESAFE_JEV_ENABLED"], "true")
+        self.assertEqual(child_environment["TYPESAFE_API_KEY"], "fixture-only-key-material")
+        self.assertEqual(keychain.call_args.args[0][0:2], ["security", "find-generic-password"])
+
+    def test_jev_key_from_environment_wins_and_disabled_config_removes_it(self) -> None:
+        home = self.parent / "machine-home-jev-precedence"
+        config = home / ".config" / "codex-harness" / "config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({"jev": {"enabled": True, "keychainService": "fixture-service"}}))
+        child_environment = {"TYPESAFE_API_KEY": "environment-fixture-key"}
+        with patch.dict(os.environ, {"HOME": str(home)}, clear=False), \
+                patch.object(risk_gate_config.subprocess, "run") as keychain:
+            risk_gate_config.configure_jev_environment(child_environment)
+        self.assertEqual(child_environment["TYPESAFE_API_KEY"], "environment-fixture-key")
+        keychain.assert_not_called()
+        config.write_text(json.dumps({"jev": {"enabled": False}}))
+        risk_gate_config.configure_jev_environment(child_environment)
+        self.assertNotIn("TYPESAFE_API_KEY", child_environment)
+        self.assertEqual(child_environment["TYPESAFE_JEV_ENABLED"], "false")
+
+    def test_jev_enabled_without_environment_or_keychain_returns_configuration_error(self) -> None:
+        home = self.parent / "machine-home-jev-missing"
+        config = home / ".config" / "codex-harness" / "config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({"jev": {"enabled": True, "keychainService": "fixture-service"}}))
+        with patch.dict(os.environ, {"HOME": str(home)}, clear=False), \
+                patch.object(risk_gate_config.sys, "platform", "linux"):
+            with self.assertRaisesRegex(risk_gate_config.ConfigurationError, "API key is unavailable"):
+                risk_gate_config.configure_jev_environment({})
+
+    def test_risk_check_passes_jev_key_only_to_child_and_never_outputs_it(self) -> None:
+        home = self.parent / "machine-home-risk-child"
+        config_dir = home / ".config" / "codex-harness"
+        config_dir.mkdir(parents=True)
+        risk_home = self.parent / "risk-child"
+        risk_home.mkdir()
+        wrapper = risk_home / "gradlew"
+        wrapper.write_text("#!/bin/sh\nexit 0\n")
+        wrapper.chmod(0o755)
+        libs = risk_home / "build" / "libs"
+        libs.mkdir(parents=True)
+        (libs / "risk-gate.jar").touch()
+        fake_bin = self.parent / "fake-bin-risk-child"
+        fake_bin.mkdir()
+        fake_java = fake_bin / "java"
+        fake_java.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$TYPESAFE_API_KEY\" = \"fixture-child-only-key\" ] && [ \"$TYPESAFE_JEV_ENABLED\" = true ]; then\n"
+            "  printf '%s\\n' '{\"decision\":\"PASS\",\"reasonCodes\":[\"KEY_FORWARDED\"]}'\n"
+            "else\n"
+            "  printf '%s\\n' '{\"decision\":\"ERROR\",\"reasonCodes\":[]}'\n"
+            "fi\n"
+            "exit 0\n"
+        )
+        fake_java.chmod(0o755)
+        (config_dir / "config.json").write_text(json.dumps({
+            "riskGateHome": str(risk_home),
+            "jev": {"enabled": True, "keychainService": "fixture-service"},
+        }))
+        report = self.root / "build/reports/build-convention/report.json"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text("{}")
+        environment = os.environ.copy()
+        environment.update({
+            "HOME": str(home),
+            "PATH": str(fake_bin) + os.pathsep + environment.get("PATH", ""),
+            "TYPESAFE_API_KEY": "fixture-child-only-key",
+        })
+        result = subprocess.run(
+            [str(ROOT / "bin" / "risk-check")], cwd=self.root, env=environment,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout)["reasonCodes"], ["KEY_FORWARDED"])
+        self.assertNotIn("fixture-child-only-key", result.stdout + result.stderr)
 
     def test_risk_check_reports_missing_configuration_and_preserves_cli_codes(self) -> None:
         env = os.environ.copy()

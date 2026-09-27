@@ -1,3 +1,7 @@
 {
-  "riskGateHome": "/absolute/path/to/risk-gate"
+  "riskGateHome": "/absolute/path/to/risk-gate",
+  "jev": {
+    "enabled": true,
+    "keychainService": "risk-gate-typesafe-api-key"
+  }
 }

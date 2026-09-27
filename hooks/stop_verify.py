@@ -77,6 +77,11 @@ def clear_state(path: Path, session_id: str) -> None:
         path.unlink()
     except FileNotFoundError:
         pass
+    attempted_path = path.with_suffix(".mutating-tool")
+    try:
+        attempted_path.unlink()
+    except FileNotFoundError:
+        pass
     session_key = hashlib.sha256(session_id.encode("utf-8", "surrogatepass")).hexdigest()
     active_path = state_dir() / f"{session_key}.active"
     try:
@@ -202,7 +207,7 @@ def run_risk_gate(root: Path) -> tuple[str, list[str], str]:
         payload = json.loads(result.stdout)
         decision = payload.get("decision") if isinstance(payload, dict) else None
         reason_codes = payload.get("reasonCodes", []) if isinstance(payload, dict) else None
-        if decision not in ("PASS", "BLOCK", "REVIEW", "NOT_CONFIGURED", "ERROR"):
+        if decision not in ("PASS", "BLOCK", "REVIEW", "NOT_CONFIGURED", "ERROR", "CONFIGURATION_ERROR"):
             raise ValueError("unrecognized result")
         if not isinstance(reason_codes, list) or not all(isinstance(code, str) for code in reason_codes):
             raise ValueError("invalid reason codes")
@@ -212,7 +217,7 @@ def run_risk_gate(root: Path) -> tuple[str, list[str], str]:
             raise ValueError("exit code mismatch")
         if decision == "BLOCK" and result.returncode != 3:
             raise ValueError("exit code mismatch")
-        if decision in ("NOT_CONFIGURED", "ERROR") and result.returncode != 4:
+        if decision in ("NOT_CONFIGURED", "ERROR", "CONFIGURATION_ERROR") and result.returncode != 4:
             raise ValueError("exit code mismatch")
         message = payload.get("message", "")
         return decision, reason_codes, message if isinstance(message, str) else ""
@@ -251,7 +256,12 @@ def main() -> int:
             return 0
         state_path = state_dir() / f"{state_key(session_id, turn_id)}.json"
         if not state_path.is_file():
-            emit({"systemMessage": "NEEDS_REVIEW: Codex Harness has no snapshot for this turn; verification could not determine changed files."})
+            attempted_path = state_path.with_suffix(".mutating-tool")
+            if attempted_path.is_file():
+                clear_state(state_path, session_id)
+                emit({"systemMessage": "NEEDS_REVIEW: Codex Harness could not snapshot the repository before a mutating-capable tool ran."})
+            else:
+                emit({})
             return 0
         state = json.loads(state_path.read_text(encoding="utf-8"))
         root = Path(state["root"])
@@ -304,6 +314,9 @@ def main() -> int:
             elif decision == "NOT_CONFIGURED":
                 clear_state(state_path, session_id)
                 emit({"systemMessage": "Gradle check passed. Local Risk Gate: NOT_CONFIGURED. Configure riskGateHome in ~/.config/codex-harness/config.json or set RISK_GATE_HOME."})
+            elif decision == "CONFIGURATION_ERROR":
+                clear_state(state_path, session_id)
+                emit({"systemMessage": f"Gradle check passed. Local Risk Gate: NEEDS_REVIEW (CONFIGURATION_ERROR). {detail}"})
             elif decision == "REVIEW":
                 clear_state(state_path, session_id)
                 emit({"systemMessage": "Hook · Gradle check passed.\nLocal Risk Gate: NEEDS_REVIEW (REVIEW)."})

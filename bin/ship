@@ -1,0 +1,5 @@
+#!/usr/bin/env python3
+"""Ship workflow interface placeholder; publishing policy is not configured."""
+
+print("NOT_CONFIGURED: ship workflow")
+raise SystemExit(3)

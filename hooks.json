@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"/Users/seongbin/programming/utility/codex-harness/hooks/turn_start.py\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"/Users/seongbin/programming/utility/codex-harness/hooks/stop_verify.py\"",
+            "timeout": 1900
+          }
+        ]
+      }
+    ]
+  }
+}

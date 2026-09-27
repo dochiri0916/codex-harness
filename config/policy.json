@@ -1,0 +1,11 @@
+{
+  "docs_only": [
+    "README.md",
+    "README.*",
+    "CHANGELOG.md",
+    "docs/**",
+    "**/*.md"
+  ],
+  "max_consecutive_failures": 5,
+  "failure_log_limit_chars": 6000
+}
